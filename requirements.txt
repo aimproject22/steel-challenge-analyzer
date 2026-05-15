@@ -2,3 +2,4 @@ streamlit
 python-docx
 openpyxl
 pandas
+scikit-learn
