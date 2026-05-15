@@ -5,6 +5,7 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+import re
 
 from parser import parse_docx
 from db_utils import (
@@ -22,13 +23,28 @@ from ml_engine import (
 
 
 def make_excel(runs_df, logs_df):
+
+    runs_df = runs_df.map(remove_illegal_characters)
+    logs_df = logs_df.map(remove_illegal_characters)
+
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        runs_df.to_excel(writer, sheet_name="Results_and_Features", index=False)
-        logs_df.to_excel(writer, sheet_name="Event_Log", index=False)
+
+        runs_df.to_excel(
+            writer,
+            sheet_name="Results_and_Features",
+            index=False
+        )
+
+        logs_df.to_excel(
+            writer,
+            sheet_name="Event_Log",
+            index=False
+        )
 
     output.seek(0)
+
     return output
 
 
