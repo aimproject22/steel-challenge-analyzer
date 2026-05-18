@@ -1,49 +1,25 @@
 # db_utils.py
 # -*- coding: utf-8 -*-
 
-import json
-import sqlite3
-from pathlib import Path
-from datetime import datetime
-
 import pandas as pd
+import streamlit as st
+from supabase import create_client
 
 from feature_engineering import extract_features_from_logs
 
 
-DB_PATH = Path("steel_challenge.db")
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uploaded_at TEXT,
-            uploader TEXT,
-            file_name TEXT,
-            score REAL,
-            cost_per_tonne REAL,
-            steel_grade TEXT,
-            data_json TEXT
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER,
-            log_no INTEGER,
-            time TEXT,
-            event TEXT,
-            FOREIGN KEY(run_id) REFERENCES runs(id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    """
+    Supabase에서는 테이블을 SQL Editor에서 이미 생성했기 때문에
+    여기서는 별도 작업을 하지 않음.
+    """
+    return None
 
 
 def save_to_db(uploader, file_name, data, logs):
@@ -57,73 +33,66 @@ def save_to_db(uploader, file_name, data, logs):
     cost_per_tonne = data.get("Cost Breakdown > Cost Per Tonne")
     steel_grade = data.get("Simulation Settings > Steel Grade")
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    run_data = {
+        "uploader": uploader,
+        "file_name": file_name,
+        "score": score,
+        "cost_per_tonne": cost_per_tonne,
+        "steel_grade": steel_grade,
+        "data_json": merged_data,
+    }
 
-    cur.execute("""
-        INSERT INTO runs (
-            uploaded_at,
-            uploader,
-            file_name,
-            score,
-            cost_per_tonne,
-            steel_grade,
-            data_json
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        uploader,
-        file_name,
-        score,
-        cost_per_tonne,
-        steel_grade,
-        json.dumps(merged_data, ensure_ascii=False)
-    ))
+    run_response = (
+        supabase
+        .table("runs")
+        .insert(run_data)
+        .execute()
+    )
 
-    run_id = cur.lastrowid
+    if not run_response.data:
+        raise RuntimeError("Supabase runs 테이블 저장 실패")
+
+    run_id = run_response.data[0]["id"]
+
+    log_rows = []
 
     for log in logs:
-        cur.execute("""
-            INSERT INTO logs (
-                run_id,
-                log_no,
-                time,
-                event
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            run_id,
-            log["log_no"],
-            log["time"],
-            log["event"]
-        ))
+        log_rows.append({
+            "run_id": run_id,
+            "log_no": log["log_no"],
+            "time": log["time"],
+            "event": log["event"],
+        })
 
-    conn.commit()
-    conn.close()
+    if log_rows:
+        supabase.table("logs").insert(log_rows).execute()
 
 
 def load_runs_df():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM runs ORDER BY id DESC", conn)
-    conn.close()
+    response = (
+        supabase
+        .table("runs")
+        .select("*")
+        .order("id", desc=True)
+        .execute()
+    )
 
-    if df.empty:
-        return df
+    if not response.data:
+        return pd.DataFrame()
 
     rows = []
 
-    for _, row in df.iterrows():
-        data = json.loads(row["data_json"])
+    for row in response.data:
+        data = row.get("data_json") or {}
 
         new_row = {
-            "Run ID": row["id"],
-            "Uploaded At": row["uploaded_at"],
-            "Uploader": row["uploader"],
-            "File Name": row["file_name"],
-            "Score": row["score"],
-            "Cost Per Tonne": row["cost_per_tonne"],
-            "Steel Grade": row["steel_grade"],
+            "Run ID": row.get("id"),
+            "Uploaded At": row.get("uploaded_at"),
+            "Uploader": row.get("uploader"),
+            "File Name": row.get("file_name"),
+            "Score": row.get("score"),
+            "Cost Per Tonne": row.get("cost_per_tonne"),
+            "Steel Grade": row.get("steel_grade"),
         }
 
         new_row.update(data)
@@ -133,32 +102,21 @@ def load_runs_df():
 
 
 def load_logs_df():
-    conn = sqlite3.connect(DB_PATH)
+    response = (
+        supabase
+        .table("logs")
+        .select("*")
+        .order("run_id", desc=True)
+        .order("log_no", desc=False)
+        .execute()
+    )
 
-    query = """
-        SELECT
-            runs.id AS run_id,
-            runs.uploaded_at,
-            runs.uploader,
-            runs.file_name,
-            logs.log_no,
-            logs.time,
-            logs.event
-        FROM logs
-        JOIN runs ON logs.run_id = runs.id
-        ORDER BY runs.id DESC, logs.log_no ASC
-    """
+    if not response.data:
+        return pd.DataFrame()
 
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-
-    return df
+    return pd.DataFrame(response.data)
 
 
 def reset_database():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM logs")
-    cur.execute("DELETE FROM runs")
-    conn.commit()
-    conn.close()
+    supabase.table("logs").delete().neq("id", 0).execute()
+    supabase.table("runs").delete().neq("id", 0).execute()

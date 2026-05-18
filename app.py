@@ -1,11 +1,11 @@
 # app.py
 # -*- coding: utf-8 -*-
 
+import re
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-import re
 
 from parser import parse_docx
 from db_utils import (
@@ -22,15 +22,24 @@ from ml_engine import (
 )
 
 
-def make_excel(runs_df, logs_df):
+def remove_illegal_characters(value):
+    if isinstance(value, str):
+        value = re.sub(
+            r"[\x00-\x08\x0B-\x0C\x0E-\x1F]",
+            "",
+            value
+        )
 
-    runs_df = runs_df.map(remove_illegal_characters)
-    logs_df = logs_df.map(remove_illegal_characters)
+    return value
+
+
+def make_excel(runs_df, logs_df):
+    runs_df = runs_df.applymap(remove_illegal_characters)
+    logs_df = logs_df.applymap(remove_illegal_characters)
 
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
         runs_df.to_excel(
             writer,
             sheet_name="Results_and_Features",
@@ -44,7 +53,6 @@ def make_excel(runs_df, logs_df):
         )
 
     output.seek(0)
-
     return output
 
 
@@ -56,7 +64,7 @@ st.set_page_config(
 init_db()
 
 st.title("Steel Challenge AI 공정 분석 플랫폼")
-st.caption("DOCX 업로드 → DB 저장 → Feature 추출 → ML 학습 → 공정 추천")
+st.caption("DOCX 업로드 → Supabase DB 저장 → Feature 추출 → ML 학습 → 공정 추천")
 
 uploader = st.text_input("업로드한 사람 이름", placeholder="예: 하준영")
 
@@ -95,8 +103,15 @@ logs_df = load_logs_df()
 if runs_df.empty:
     st.info("아직 저장된 결과가 없습니다.")
 else:
-    feature_cols = [c for c in runs_df.columns if str(c).startswith("feature >")]
-    base_cols = [c for c in runs_df.columns if not str(c).startswith("feature >")]
+    feature_cols = [
+        c for c in runs_df.columns
+        if str(c).startswith("feature >")
+    ]
+
+    base_cols = [
+        c for c in runs_df.columns
+        if not str(c).startswith("feature >")
+    ]
 
     tab1, tab2, tab3, tab4 = st.tabs(
         ["전체 결과", "ML Feature", "Event Log", "ML 추천"]
@@ -110,14 +125,33 @@ else:
         st.subheader("ML용 Feature 테이블")
 
         if feature_cols:
-            view_cols = ["Run ID", "Uploader", "File Name", "Score", "Cost Per Tonne"] + feature_cols
-            st.dataframe(runs_df[view_cols], use_container_width=True)
+            view_cols = [
+                "Run ID",
+                "Uploader",
+                "File Name",
+                "Score",
+                "Cost Per Tonne",
+            ] + feature_cols
+
+            existing_cols = [
+                c for c in view_cols
+                if c in runs_df.columns
+            ]
+
+            st.dataframe(
+                runs_df[existing_cols],
+                use_container_width=True
+            )
         else:
             st.info("아직 추출된 feature가 없습니다.")
 
     with tab3:
         st.subheader("Event Log 전체 기록")
-        st.dataframe(logs_df, use_container_width=True)
+
+        if logs_df.empty:
+            st.info("아직 Event Log가 없습니다.")
+        else:
+            st.dataframe(logs_df, use_container_width=True)
 
     with tab4:
         st.subheader("ML 기반 공정 추천")
@@ -139,25 +173,39 @@ else:
                 st.metric("Feature Count", len(used_features))
 
             st.markdown("### Score 영향 Feature Importance")
-            st.dataframe(importance_df.head(20), use_container_width=True)
+            st.dataframe(
+                importance_df.head(20),
+                use_container_width=True
+            )
 
             st.markdown("### 추천 공정 변화 방향")
-            recommendations = generate_recommendations(runs_df, importance_df)
+            recommendations = generate_recommendations(
+                runs_df,
+                importance_df
+            )
 
             if recommendations:
                 rec_df = pd.DataFrame(recommendations)
                 st.dataframe(rec_df, use_container_width=True)
 
+                st.markdown("### 요약 추천")
                 for rec in recommendations[:5]:
                     st.write(f"- {rec['Comment']}")
             else:
                 st.info("추천을 생성할 수 없습니다.")
 
             st.markdown("### 불확실성이 큰 Run")
-            uncertainty_df = estimate_uncertainty(model, runs_df, used_features)
+            uncertainty_df = estimate_uncertainty(
+                model,
+                runs_df,
+                used_features
+            )
 
             if uncertainty_df is not None:
-                st.dataframe(uncertainty_df.head(20), use_container_width=True)
+                st.dataframe(
+                    uncertainty_df.head(20),
+                    use_container_width=True
+                )
 
             st.info(
                 "현재 추천은 fake data 기반 파이프라인 검증용입니다. "

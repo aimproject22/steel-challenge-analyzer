@@ -3,3 +3,4 @@ python-docx
 openpyxl
 pandas
 scikit-learn
+supabase
