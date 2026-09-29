@@ -93,6 +93,7 @@ def build_run_payload(
         "sender_name": sender_name or uploader,
         "sender_email": sender_email,
         "steel_user_id": data.get("Run Information > User Id"),
+        "process_type": data.get("Run Information > Process Type"),
         "run_date": _iso_run_date(data.get("Run Information > Date")),
         "status": _integer(data.get("Run Information > Status")),
         "score": _number(data.get("Run Information > Score")),
@@ -177,6 +178,9 @@ def _run_row_to_display(row: Mapping[str, Any]) -> dict:
         "Sender": row.get("sender_name") or row.get("uploader"),
         "Sender Email": row.get("sender_email"),
         "Steel User ID": _fallback(row, "steel_user_id", "Run Information > User Id"),
+        "Process Type": _fallback(
+            row, "process_type", "Run Information > Process Type"
+        ),
         "Uploader": row.get("uploader") or row.get("sender_name"),
         "File Name": row.get("file_name"),
         "Status": _fallback(row, "status", "Run Information > Status"),
@@ -227,7 +231,13 @@ def load_runs_df(
         query = query.gte("run_date", str(active["date_from"]))
     if active.get("date_to"):
         query = query.lte("run_date", str(active["date_to"]))
-    for key in ("steel_grade", "steel_user_id", "sender_email", "status"):
+    for key in (
+        "process_type",
+        "steel_grade",
+        "steel_user_id",
+        "sender_email",
+        "status",
+    ):
         value = active.get(key)
         if value not in (None, "", "전체"):
             query = query.eq(key, value)
@@ -272,6 +282,7 @@ def load_dashboard_metrics(
     params = {
         "p_date_from": active.get("date_from"),
         "p_date_to": active.get("date_to"),
+        "p_process_type": active.get("process_type") or None,
         "p_steel_grade": active.get("steel_grade") or None,
         "p_steel_user_id": active.get("steel_user_id") or None,
         "p_sender_email": active.get("sender_email") or None,

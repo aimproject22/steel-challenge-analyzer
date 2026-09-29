@@ -1,6 +1,8 @@
 # Steel Challenge Analytics Platform
 
-여러 참가자가 보낸 Steel Challenge EAF 결과 이메일과 기존 DOCX 결과를 한 데이터 모델로 수집하고, 승인된 팀 구성원만 조회·시각화·다운로드·ML 분석할 수 있게 하는 Streamlit/Supabase 플랫폼입니다.
+여러 참가자가 보낸 Steel Challenge Electric Arc Furnace·Secondary Steelmaking
+결과 이메일과 기존 DOCX 결과를 한 데이터 모델로 수집하고, 승인된 팀
+구성원만 조회·시각화·다운로드·ML 분석할 수 있게 하는 Streamlit/Supabase 플랫폼입니다.
 
 worldsteel의 공식 steelChallenge는 Electric Arc Furnace 시뮬레이터를 사용해 제한 조건 아래 생산 전략을 반복 개선하는 경연입니다. 이 프로젝트도 단일 결과의 순위만 보여주기보다 Run 간 비용·시간·공정 이벤트를 비교하도록 설계했습니다. ML과 Active Learning 결과는 관찰 데이터 기반의 탐색 보조이며 실제 최적 조업 조건으로 단정하지 않습니다. 참고: [worldsteel steelChallenge-20 발표](https://worldsteel.org/media/press-releases/2026/steelchallenge-20-world-champions-announcement/)
 
@@ -179,6 +181,7 @@ SUPABASE_SERVICE_ROLE_KEY = "YOUR_SERVICE_ROLE_KEY"
 워크플로는 [`.github/workflows/email_ingest.yml`](.github/workflows/email_ingest.yml)에 있습니다.
 
 - `workflow_dispatch`: Actions 화면에서 수동 시험
+- `retry_failed`: 수동 실행 시 기존 파싱 실패 메일을 다시 처리하는 옵션
 - `*/5 * * * *`: 약 5분 간격 예약 실행
 - `concurrency`: 이전 수집과 겹치는 동시 실행 방지
 - 개별 메시지 파싱 실패: `email_messages.parsed_status = failed`로 기록하고 다음 메시지 계속 처리

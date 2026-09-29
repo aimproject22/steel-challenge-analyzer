@@ -32,6 +32,22 @@ class EmailParseError(ValueError):
     """Raised when neither HTML nor plain text contains a valid result."""
 
 
+PROCESS_EAF = "Electric Arc Furnace"
+PROCESS_SECONDARY = "Secondary Steelmaking"
+
+
+def detect_process_type(*values: Any) -> str:
+    """Identify the Steel University simulation without trusting the sender."""
+
+    text = " ".join(normalize_text(value) for value in values if value).casefold()
+    if "secondary steelmaking" in text:
+        return PROCESS_SECONDARY
+    if "electric arc furnace" in text:
+        return PROCESS_EAF
+    # The original platform and historical DOCX fixtures are EAF results.
+    return PROCESS_EAF
+
+
 KEY_VALUE_SECTIONS = {SECTION_RUN, SECTION_SIM, SECTION_COST, SECTION_RAW, SECTION_ADD}
 MEASUREMENT_SECTIONS = {SECTION_STEEL, SECTION_SLAG}
 KNOWN_KEYS = {
@@ -91,7 +107,7 @@ def _merge_section_rows(data: dict, section: str, rows: Iterable[Iterable[Any]])
         data[candidate] = value
 
 
-def _validate_data(data: Mapping[str, Any]) -> None:
+def _validate_data(data: Mapping[str, Any], process_type: str) -> None:
     required = (
         "Run Information > User Id",
         "Run Information > Date",
@@ -100,9 +116,12 @@ def _validate_data(data: Mapping[str, Any]) -> None:
     missing = [key for key in required if data.get(key) in (None, "")]
     if missing:
         raise EmailParseError(f"필수 이메일 항목이 없습니다: {', '.join(missing)}")
+    required_sections = [SECTION_COST, SECTION_STEEL]
+    if process_type == PROCESS_EAF:
+        required_sections.extend([SECTION_ADD, SECTION_SLAG])
     missing_sections = [
         section
-        for section in (SECTION_COST, SECTION_STEEL, SECTION_ADD, SECTION_SLAG)
+        for section in required_sections
         if not any(str(key).startswith(f"{section} > ") for key in data)
     ]
     if missing_sections:
@@ -116,14 +135,23 @@ def _validate_data(data: Mapping[str, Any]) -> None:
         raise EmailParseError("Score와 Cost Per Tonne을 찾지 못했습니다.")
 
 
-def _finalize(data: dict, raw_text: str) -> tuple[dict, list[dict]]:
+def _finalize(
+    data: dict,
+    raw_text: str,
+    process_type: str,
+) -> tuple[dict, list[dict]]:
+    data["Run Information > Process Type"] = process_type
     data.update(build_structured_sections(data))
     logs = parse_event_log(raw_text)
-    _validate_data(data)
+    _validate_data(data, process_type)
     return data, logs
 
 
-def parse_html_body(html_body: str) -> tuple[dict, list[dict]]:
+def parse_html_body(
+    html_body: str,
+    *,
+    process_type: str = PROCESS_EAF,
+) -> tuple[dict, list[dict]]:
     if not normalize_text(html_body):
         raise EmailParseError("HTML 본문이 비어 있습니다.")
 
@@ -159,8 +187,8 @@ def parse_html_body(html_body: str) -> tuple[dict, list[dict]]:
 
     plain_text = soup.get_text("\n", strip=True)
     if not data:
-        return parse_plain_body(plain_text)
-    return _finalize(data, plain_text)
+        return parse_plain_body(plain_text, process_type=process_type)
+    return _finalize(data, plain_text, process_type)
 
 
 def _clean_plain_lines(plain_body: str) -> list[str]:
@@ -172,7 +200,11 @@ def _clean_plain_lines(plain_body: str) -> list[str]:
     return lines
 
 
-def parse_plain_body(plain_body: str) -> tuple[dict, list[dict]]:
+def parse_plain_body(
+    plain_body: str,
+    *,
+    process_type: str = PROCESS_EAF,
+) -> tuple[dict, list[dict]]:
     if not normalize_text(plain_body):
         raise EmailParseError("plain text 본문이 비어 있습니다.")
 
@@ -264,7 +296,7 @@ def parse_plain_body(plain_body: str) -> tuple[dict, list[dict]]:
                 continue
         index += 1
 
-    return _finalize(data, plain_body)
+    return _finalize(data, plain_body, process_type)
 
 
 def parse_steel_challenge_email(
@@ -277,10 +309,16 @@ def parse_steel_challenge_email(
 
     errors: list[str] = []
     parsed_metadata = dict(metadata or {})
+    process_type = detect_process_type(
+        parsed_metadata.get("email_subject") or parsed_metadata.get("subject"),
+        html_body,
+        plain_body,
+    )
+    parsed_metadata["process_type"] = process_type
 
     if html_body:
         try:
-            data, logs = parse_html_body(html_body)
+            data, logs = parse_html_body(html_body, process_type=process_type)
             parsed_metadata.update(
                 {
                     "parsed_status": "success",
@@ -295,7 +333,7 @@ def parse_steel_challenge_email(
 
     if plain_body:
         try:
-            data, logs = parse_plain_body(plain_body)
+            data, logs = parse_plain_body(plain_body, process_type=process_type)
             parsed_metadata.update(
                 {
                     "parsed_status": "success",

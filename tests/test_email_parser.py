@@ -54,6 +54,36 @@ def test_html_failure_falls_back_to_plain(sample_email_text: str) -> None:
     assert metadata["parser_source"] == "plain"
 
 
+def test_secondary_steelmaking_does_not_require_eaf_only_sections(
+    sample_email_html: str,
+) -> None:
+    html = sample_email_html
+    html = html.replace(
+        """<h2>Additions</h2>
+      <table><tr><td>Iron Oxide</td><td>250</td></tr>
+      <tr><td>Dolomite</td><td>450</td></tr><tr><td>Lime</td><td>700</td></tr></table>""",
+        "",
+    )
+    html = html.replace(
+        """<h2>Slag Composition</h2>
+      <table><tr><th>Element</th><th>Current</th><th>Min</th><th>Max</th></tr>
+      <tr><td>Basicity</td><td>0.852</td><td>1.5</td><td>2.5</td></tr></table>""",
+        "",
+    )
+
+    data, logs, metadata = parse_steel_challenge_email(
+        html_body=html,
+        metadata={"email_subject": "Fwd: Secondary Steelmaking"},
+    )
+
+    assert data["Run Information > Process Type"] == "Secondary Steelmaking"
+    assert data["Cost Breakdown > Cost Per Tonne"] == pytest.approx(419.22)
+    assert not any(key.startswith("Additions > ") for key in data)
+    assert not any(key.startswith("Slag Composition > ") for key in data)
+    assert logs[-1]["event"] == "Tapping complete"
+    assert metadata["process_type"] == "Secondary Steelmaking"
+
+
 def test_invalid_email_raises() -> None:
     with pytest.raises(EmailParseError):
         parse_steel_challenge_email(plain_body="not a Steel Challenge result")

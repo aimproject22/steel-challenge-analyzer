@@ -54,6 +54,7 @@ LOGGER = logging.getLogger("steel_challenge_ui")
 SEOUL = ZoneInfo("Asia/Seoul")
 RUN_COLUMNS = [
     "Run Date",
+    "Process Type",
     "Sender",
     "Sender Email",
     "Steel User ID",
@@ -192,6 +193,11 @@ def _filters(prefix: str) -> dict[str, Any]:
     with st.expander("필터", expanded=True):
         col1, col2, col3 = st.columns(3)
         with col1:
+            process_type = st.selectbox(
+                "Process Type",
+                ["전체", "Electric Arc Furnace", "Secondary Steelmaking"],
+                key=f"{prefix}_process_type",
+            )
             grade = st.text_input("Steel Grade (정확히 일치)", key=f"{prefix}_grade")
             steel_user = st.text_input(
                 "Steel Challenge User ID (정확히 일치)",
@@ -215,6 +221,8 @@ def _filters(prefix: str) -> dict[str, Any]:
             )
 
     result: dict[str, Any] = {}
+    if process_type != "전체":
+        result["process_type"] = process_type
     if grade.strip():
         result["steel_grade"] = grade.strip()
     if steel_user.strip():
@@ -388,7 +396,8 @@ def render_run_detail(context: AuthContext) -> None:
     labels = {
         int(row["Run ID"]): (
             f"#{int(row['Run ID'])} · {row.get('Run Date', '—')} · "
-            f"{row.get('Steel User ID', '—')} · {row.get('Steel Grade', '—')}"
+            f"{row.get('Process Type', '—')} · {row.get('Steel User ID', '—')} · "
+            f"{row.get('Steel Grade', '—')}"
         )
         for _, row in recent.iterrows()
         if pd.notna(row.get("Run ID"))
@@ -413,6 +422,8 @@ def render_run_detail(context: AuthContext) -> None:
     metadata = {
         "Run ID": record.get("id"),
         "Source": record.get("source"),
+        "Process Type": record.get("process_type")
+        or data.get("Run Information > Process Type"),
         "Sender": record.get("sender_name"),
         "Sender Email": record.get("sender_email"),
         "Steel User ID": record.get("steel_user_id"),

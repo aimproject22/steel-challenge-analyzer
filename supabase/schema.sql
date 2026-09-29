@@ -46,6 +46,7 @@ create table if not exists public.runs (
     sender_name text,
     sender_email text,
     steel_user_id text,
+    process_type text,
     run_date timestamptz,
     status integer,
     score double precision,
@@ -78,6 +79,7 @@ alter table public.runs add column if not exists created_by uuid;
 alter table public.runs add column if not exists sender_name text;
 alter table public.runs add column if not exists sender_email text;
 alter table public.runs add column if not exists steel_user_id text;
+alter table public.runs add column if not exists process_type text;
 alter table public.runs add column if not exists run_date timestamptz;
 alter table public.runs add column if not exists status integer;
 alter table public.runs add column if not exists score double precision;
@@ -182,8 +184,23 @@ begin
 end $$;
 
 -- Backfill direct columns so legacy JSON rows participate in filtering/KPIs.
-update public.runs
+update public.runs as r
 set steel_user_id = coalesce(steel_user_id, data_json ->> 'Run Information > User Id'),
+    process_type = coalesce(
+        process_type,
+        data_json ->> 'Run Information > Process Type',
+        case
+            when email_message_id is not null then (
+                select case
+                    when e.subject ilike '%secondary steelmaking%'
+                        then 'Secondary Steelmaking'
+                    else 'Electric Arc Furnace'
+                end
+                from public.email_messages e
+                where e.id = r.email_message_id
+            )
+        end
+    ),
     status = coalesce(
         status,
         case when data_json ->> 'Run Information > Status' ~ '^[-+]?[0-9]+$'
@@ -265,6 +282,7 @@ create unique index if not exists runs_email_message_id_unique_idx
     on public.runs(email_message_id)
     where email_message_id is not null;
 create index if not exists runs_run_date_idx on public.runs(run_date desc);
+create index if not exists runs_process_type_idx on public.runs(process_type);
 create index if not exists runs_steel_grade_idx on public.runs(steel_grade);
 create index if not exists runs_steel_user_id_idx on public.runs(steel_user_id);
 create index if not exists runs_sender_email_idx on public.runs(sender_email);
@@ -368,7 +386,7 @@ begin
 
     insert into public.runs (
         email_message_id, source, created_by, sender_name, sender_email,
-        steel_user_id, run_date, status, score, user_level, steel_grade,
+        steel_user_id, process_type, run_date, status, score, user_level, steel_grade,
         time_minutes, tapping_mass, tap_temperature, total_energy_kwh,
         energy_kwh_per_t, power_cost, scrap_cost, additions_cost,
         other_consumables_cost, total_cost, cost_per_tonne,
@@ -380,6 +398,7 @@ begin
         run_payload ->> 'sender_name',
         run_payload ->> 'sender_email',
         run_payload ->> 'steel_user_id',
+        run_payload ->> 'process_type',
         nullif(run_payload ->> 'run_date', '')::timestamptz,
         nullif(run_payload ->> 'status', '')::integer,
         nullif(run_payload ->> 'score', '')::double precision,
@@ -422,9 +441,13 @@ $$;
 
 -- Small server-side aggregates keep the dashboard responsive as the tables grow.
 -- SECURITY INVOKER deliberately preserves runs/email_messages RLS.
+drop function if exists public.dashboard_metrics(
+    timestamptz, timestamptz, text, text, text, integer
+);
 create or replace function public.dashboard_metrics(
     p_date_from timestamptz default null,
     p_date_to timestamptz default null,
+    p_process_type text default null,
     p_steel_grade text default null,
     p_steel_user_id text default null,
     p_sender_email text default null,
@@ -451,6 +474,7 @@ as $$
     from public.runs r
     where (p_date_from is null or r.run_date >= p_date_from)
       and (p_date_to is null or r.run_date <= p_date_to)
+      and (p_process_type is null or r.process_type = p_process_type)
       and (p_steel_grade is null or r.steel_grade = p_steel_grade)
       and (p_steel_user_id is null or r.steel_user_id = p_steel_user_id)
       and (p_sender_email is null or r.sender_email = p_sender_email)

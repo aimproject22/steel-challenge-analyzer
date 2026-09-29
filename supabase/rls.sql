@@ -73,7 +73,7 @@ revoke all on table public.logs from anon, authenticated;
 
 revoke all on function public.save_run_with_logs(jsonb, jsonb) from public, anon;
 revoke all on function public.dashboard_metrics(
-    timestamptz, timestamptz, text, text, text, integer
+    timestamptz, timestamptz, text, text, text, text, integer
 ) from public, anon;
 revoke all on function public.data_quality_metrics() from public, anon;
 
@@ -90,7 +90,7 @@ grant usage, select on all sequences in schema public to service_role;
 grant execute on function public.save_run_with_logs(jsonb, jsonb)
     to authenticated, service_role;
 grant execute on function public.dashboard_metrics(
-    timestamptz, timestamptz, text, text, text, integer
+    timestamptz, timestamptz, text, text, text, text, integer
 ) to authenticated;
 grant execute on function public.data_quality_metrics() to authenticated;
 
