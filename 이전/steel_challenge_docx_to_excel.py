@@ -548,15 +548,4 @@ else:
     )
 
 
-st.divider()
-
-with st.expander("관리자용: 전체 데이터 초기화"):
-    password = st.text_input("관리자 비밀번호", type="password")
-
-    if st.button("DB 전체 초기화"):
-        if password == "1234":
-            reset_database()
-            st.success("DB 초기화 완료")
-            st.rerun()
-        else:
-            st.error("비밀번호가 틀렸습니다.")
+# 운영용 앱에서는 Supabase Auth/RLS를 사용하며 DB 전체 초기화 UI를 제공하지 않습니다.

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.venv/
+venv/
+.streamlit/secrets.toml
+token.json
+credentials.json
+client_secret*.json
+/py
