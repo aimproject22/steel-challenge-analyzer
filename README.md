@@ -230,6 +230,11 @@ Streamlit Community Cloud 기준:
 5. 승인되지 않은 계정, viewer, downloader, admin 네 권한 조합을 각각 시험합니다.
 6. GitHub Actions는 Streamlit과 별도로 Gmail을 수집하므로 Streamlit 프로세스에 polling loop가 없습니다.
 
+임시 공개 모드에서는 Streamlit Secrets에 `PUBLIC_ACCESS_ENABLED = true`를 설정합니다.
+공개 방문자는 조회·분석·Excel 다운로드를 사용하고, 업로드·데이터 품질·사용자
+관리는 화면의 `관리자 로그인`으로 인증한 admin에게만 표시됩니다. 나중에 다시
+인증 필수로 전환하려면 값을 `false`로 바꾸거나 제거하면 됩니다.
+
 다른 호스팅에서도 환경변수 우선, `st.secrets` fallback으로 동일하게 동작합니다.
 
 ## 13. Security notes

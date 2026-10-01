@@ -151,16 +151,29 @@ def render_pending_page(context: AuthContext) -> None:
 
 
 def render_header(context: AuthContext) -> None:
-    title_col, user_col, logout_col = st.columns([5, 2, 1])
+    is_public = bool(context.profile.get("public_access"))
+    title_col, user_col, refresh_col, logout_col = st.columns([5, 2, 1, 1])
     with title_col:
         st.title("Steel Challenge Dashboard")
-        st.caption("Electric Arc Furnace Simulation 결과 분석 플랫폼")
+        st.caption("Electric Arc Furnace · Secondary Steelmaking 결과 분석 플랫폼")
     with user_col:
-        st.markdown(f"**{context.profile.get('display_name') or context.user.email}**")
-        st.caption(str(context.user.email or ""))
+        if is_public:
+            st.markdown("**Public Dashboard**")
+            st.caption("로그인 없이 조회 중")
+        else:
+            st.markdown(f"**{context.profile.get('display_name') or context.user.email}**")
+            st.caption(str(context.user.email or ""))
+    with refresh_col:
+        if st.button("새로고침", use_container_width=True):
+            st.rerun()
     with logout_col:
-        if st.button("로그아웃", use_container_width=True):
+        if is_public:
+            if st.button("관리자 로그인", use_container_width=True):
+                st.query_params["admin"] = "1"
+                st.rerun()
+        elif st.button("로그아웃", use_container_width=True):
             sign_out(context.client)
+            st.query_params.clear()
             st.rerun()
 
 
@@ -172,8 +185,11 @@ def page_names(profile: Mapping[str, Any]) -> list[str]:
         "시각화",
         "ML 분석",
         "Active Learning",
-        "수동 업로드",
     ]
+    if profile.get("public_access"):
+        pages.append("다운로드")
+        return pages
+    pages.append("수동 업로드")
     if profile.get("can_download"):
         pages.append("다운로드")
     if profile.get("is_admin"):
@@ -689,7 +705,8 @@ def render_manual_upload(context: AuthContext) -> None:
 def _build_download(
     context: AuthContext, filters: Optional[Mapping[str, Any]]
 ) -> tuple[bytes, int, int]:
-    assert_can_download(context.client, str(context.user.id))
+    if not context.profile.get("public_access"):
+        assert_can_download(context.client, str(context.user.id))
     runs = load_all_runs_df(context.client, filters=filters, max_rows=10000)
     run_ids = [
         int(value)
@@ -701,7 +718,10 @@ def _build_download(
 
 def render_download(context: AuthContext) -> None:
     st.subheader("다운로드")
-    st.info("권한은 Excel 생성 직전에 서버에서 다시 확인합니다.")
+    if context.profile.get("public_access"):
+        st.info("공개 조회 모드에서 Excel 다운로드가 활성화되어 있습니다.")
+    else:
+        st.info("권한은 Excel 생성 직전에 서버에서 다시 확인합니다.")
     filters = _filters("download")
     left, right = st.columns(2)
     with left:

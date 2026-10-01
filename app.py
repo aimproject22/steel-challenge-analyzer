@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import streamlit as st
 
-from auth_utils import ConfigurationError, restore_session
+from auth_utils import AuthContext, ConfigurationError, create_service_client, restore_session
+from config import public_access_enabled
 from ui_components import (
     apply_theme,
     render_header,
@@ -28,22 +30,48 @@ st.set_page_config(
 )
 apply_theme()
 
-try:
-    auth_context = restore_session()
-except ConfigurationError as exc:
-    st.error(str(exc))
-    st.info(".streamlit/secrets.toml 또는 환경변수에 Supabase 설정을 추가하세요.")
-    st.stop()
-except Exception:
-    LOGGER.exception("Could not restore auth session")
-    st.error("로그인 세션을 확인하는 중 문제가 발생했습니다. 다시 로그인해 주세요.")
-    auth_context = None
+public_site_enabled = public_access_enabled()
+admin_mode_requested = str(st.query_params.get("admin", "")).casefold() in {
+    "1",
+    "true",
+    "yes",
+}
+
+if public_site_enabled and not admin_mode_requested:
+    try:
+        auth_context = AuthContext(
+            client=create_service_client(),
+            user=SimpleNamespace(id="public", email=""),
+            profile={
+                "approved": True,
+                "can_view": True,
+                "can_download": True,
+                "is_admin": False,
+                "public_access": True,
+                "display_name": "Public Dashboard",
+            },
+        )
+    except ConfigurationError as exc:
+        st.error(str(exc))
+        st.info("공개 모드에는 서버용 Supabase Secret Key가 필요합니다.")
+        st.stop()
+else:
+    try:
+        auth_context = restore_session()
+    except ConfigurationError as exc:
+        st.error(str(exc))
+        st.info(".streamlit/secrets.toml 또는 환경변수에 Supabase 설정을 추가하세요.")
+        st.stop()
+    except Exception:
+        LOGGER.exception("Could not restore auth session")
+        st.error("로그인 세션을 확인하는 중 문제가 발생했습니다. 다시 로그인해 주세요.")
+        auth_context = None
 
 if auth_context is None:
     render_login_page()
     st.stop()
 
-if not (
+if not auth_context.profile.get("public_access") and not (
     auth_context.profile.get("approved")
     and auth_context.profile.get("can_view")
 ):

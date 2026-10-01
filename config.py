@@ -68,3 +68,14 @@ def get_supabase_service_key(*, required: bool = False) -> Optional[str]:
         aliases=("SUPABASE_SECRET_KEY",),
     )
 
+
+def public_access_enabled() -> bool:
+    """Return whether the read-only public dashboard mode is enabled."""
+
+    value = get_secret("PUBLIC_ACCESS_ENABLED", required=False)
+    return str(value or "false").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
