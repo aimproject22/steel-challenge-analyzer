@@ -503,6 +503,8 @@ begin
 end;
 $$;
 
+notify pgrst, 'reload schema';
+
 -- Small server-side aggregates keep the dashboard responsive as the tables grow.
 -- SECURITY INVOKER deliberately preserves runs/email_messages RLS.
 drop function if exists public.dashboard_metrics(

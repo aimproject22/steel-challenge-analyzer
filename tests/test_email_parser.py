@@ -88,6 +88,25 @@ def test_secondary_steelmaking_does_not_require_eaf_only_sections(
     assert metadata["process_type"] == "Secondary Steelmaking"
 
 
+def test_eaf_without_additions_detail_table_is_still_valid(
+    sample_email_html: str,
+) -> None:
+    html = sample_email_html.replace(
+        """<h2>Additions</h2>
+      <table><tr><td>Iron Oxide</td><td>250</td></tr>
+      <tr><td>Dolomite</td><td>450</td></tr><tr><td>Lime</td><td>700</td></tr></table>""",
+        "",
+    )
+
+    data, logs, metadata = parse_steel_challenge_email(html_body=html)
+
+    assert data["Run Information > Process Type"] == "Electric Arc Furnace"
+    assert data["Cost Breakdown > Cost Per Tonne"] == pytest.approx(419.22)
+    assert not any(key.startswith("Additions > ") for key in data)
+    assert logs[-1]["event"] == "Tapping complete"
+    assert metadata["parser_source"] == "html"
+
+
 def test_invalid_email_raises() -> None:
     with pytest.raises(EmailParseError):
         parse_steel_challenge_email(plain_body="not a Steel Challenge result")

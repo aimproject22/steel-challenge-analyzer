@@ -187,7 +187,10 @@ def _validate_data(data: Mapping[str, Any], process_type: str) -> None:
         raise EmailParseError(f"필수 이메일 항목이 없습니다: {', '.join(missing)}")
     required_sections = [SECTION_COST, SECTION_STEEL]
     if process_type == PROCESS_EAF:
-        required_sections.extend([SECTION_ADD, SECTION_SLAG])
+        # Some valid EAF results omit the Additions detail table when nothing
+        # was added.  Cost Breakdown still carries the additions cost, so the
+        # missing detail table must not invalidate an otherwise complete run.
+        required_sections.append(SECTION_SLAG)
     missing_sections = [
         section
         for section in required_sections

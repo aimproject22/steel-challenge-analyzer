@@ -158,4 +158,7 @@ revoke all on function public.replace_email_runs_with_logs(bigint, jsonb)
 grant execute on function public.replace_email_runs_with_logs(bigint, jsonb)
     to service_role;
 
+-- Make newly created RPC signatures visible to PostgREST immediately.
+notify pgrst, 'reload schema';
+
 commit;
