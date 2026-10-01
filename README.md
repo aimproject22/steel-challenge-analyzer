@@ -250,6 +250,10 @@ Streamlit Community Cloud 기준:
 - Event Log는 `log_no`를 보존하고 `event_seconds`를 별도 저장합니다.
 - Status 0/1의 의미를 임의로 성공/실패로 표시하지 않습니다.
 - ML은 숫자 feature만 사용하고 목표별 직접 누출 feature를 제외하며, 20개 미만이면 학습하지 않습니다.
+- ML은 post-run Steel/Slag 품질, raw text, objective proxy를 입력에서 제외합니다.
+  all-null·80% 초과 missing·상수·거의 완전 상관 feature는 학습 단계에서만
+  제거하고, 병합 의심 Run은 자동 제외합니다. feature 수가 학습 표본의 절반보다
+  많으면 UI에 경고합니다.
 - Active Learning 후보는 관측된 controllable feature의 min/max 안에서만 생성되지만 실제 조업 안전성을 보증하지 않습니다.
 - 앱 Excel 상한은 Runs 10,000건, Logs 100,000건입니다. 그 이상은 Supabase의 관리형 export를 사용하세요.
 
@@ -268,17 +272,36 @@ Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. �
 - Raw Materials, Additions, Steel/Slag Composition은 Run별 wide format으로
   정리됩니다. 새 material, element, power setpoint는 union schema에 동적으로
   추가되며 동일 schema의 열 순서는 항상 같습니다.
+- Report Raw Materials/Additions가 없으면 Event Log의 Basket/Additions를 합산해
+  복원하고 `QUALITY_rm_source`, `QUALITY_add_source`에 provenance를 기록합니다.
+  같은 Basket 안에 같은 재료가 반복되면 마지막 값으로 덮지 않고 합산합니다.
+- Cost Breakdown raw label은 그대로 보존합니다. Scrap raw가 process time과 같고
+  나머지 세 raw 값이 Total Cost와 내부적으로 일치하는 알려진 label-shift 패턴만
+  corrected cost로 재배치합니다. 공식 가격 master가 없으므로 단가 기반 비용은
+  임의 계산하지 않습니다.
+- `QUALITY_chemistry_pass`는 Steel/Slag chemistry만 뜻합니다. 온도·시간·질량·CO2
+  spec이 모두 확인되지 않으면 `QUALITY_full_validation_available=0`이고
+  `QUALITY_overall_pass`는 생성하지 않습니다.
+- Min/Max가 없는 composition element는 Current 열만 생성합니다. 전체 Run에서
+  완전히 비어 있는 열과 의미·값이 모두 같은 지정된 표시 중복 열은 export에서
+  제거되므로 열 수는 데이터에 따라 달라집니다.
 - Event Log는 Run ID별로 한 번 group하여 Power 지속시간, Basket 시각/질량,
   Addition 시각, Analysis 대기시간, Tapping 시각 등의 feature로 변환됩니다.
 - 원본 Event Log와 인식하지 못한 이벤트도 버리지 않습니다. Excel 셀 제한을
   넘는 로그는 30,000자 단위의 `RAW_event_log_01`, `_02`, ... 열로 손실 없이
   나눕니다.
-- 세부 그룹은 Excel outline으로 접을 수 있고 header filter와 `G2` freeze pane을
-  적용합니다.
+- Steel/Slag spec 상세, Basket 재료 상세, Power setpoint별 지속시간, Addition timing,
+  Analysis, Derived, Raw Log는 기본 접힘 Excel outline으로 제공하며 header filter와
+  `G2` freeze pane을 적용합니다.
+- Power 적분은 actual energy가 아니라 setpoint 적분입니다.
+  `PWR_setpoint_integral_MW_sec`, `PWR_setpoint_integral_MW_min`,
+  `PWR_setpoint_equivalent_MWh`로 명시하고 actual energy는
+  `PERF_total_energy_kwh`만 사용합니다.
 - 내부 DB/ML의 기존 `feature >` 이름은 유지합니다. Final Steel/Slag와 Raw Log는
   기존 ML 입력에 자동 추가하지 않습니다.
-- 과거 방식으로 여러 결과가 한 DB 행에 합쳐진 경우에는 값을 임의로 버리지 않고
-  Excel 생성을 중단하며 재처리할 Run ID를 오류에 표시합니다.
+- 과거 방식으로 여러 결과가 한 DB 행에 합쳐진 의심 record는 값을 삭제하지 않고
+  `QUALITY_multi_run_merged_detected=1`로 표시합니다. ML 학습에서는 제외하며,
+  원본 Gmail 재처리 절차로 별도 Run으로 복구합니다.
 
 ## 15. Composite Gmail result repair
 

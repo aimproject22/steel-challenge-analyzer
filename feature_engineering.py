@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping, Optional
 
-from canonical import event_time_to_seconds, normalize_event_log
+from canonical import event_time_to_seconds, normalize_event_log, normalize_material_name
 from export_features import extract_event_export_features
 
 
@@ -87,12 +87,16 @@ def _addition_totals(events: list[dict]) -> dict[str, float]:
         if "addition" not in event.casefold() or ":" not in event:
             continue
         payload = event.split(":", 1)[1]
-        for name, number in re.findall(
-            r"(?:^|;)\s*([^:;]+?)\s*:\s*([-+]?\d[\d,]*(?:\.\d+)?)\s*kg\b",
-            payload,
-            flags=re.I,
-        ):
-            canonical_name = re.sub(r"\s+", " ", name).strip()
+        for part in payload.split(";"):
+            match = re.match(
+                r"^\s*(.+?)(?:\s*:\s*|\s+)([-+]?\d[\d,]*(?:\.\d+)?)\s*kg\s*$",
+                part,
+                flags=re.I,
+            )
+            if not match:
+                continue
+            name, number = match.groups()
+            canonical_name = normalize_material_name(name, addition=True)
             totals[canonical_name] = totals.get(canonical_name, 0.0) + float(
                 number.replace(",", "")
             )

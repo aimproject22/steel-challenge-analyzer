@@ -162,3 +162,30 @@ def test_single_result_api_rejects_composite_email(sample_email_html: str) -> No
     )
     with pytest.raises(EmailParseError, match="2개"):
         parse_steel_challenge_email(html_body=combined)
+
+
+def test_three_html_results_produce_three_independent_runs(
+    sample_email_html: str,
+) -> None:
+    fragments = []
+    for index in range(3):
+        fragment = (
+            sample_email_html
+            .replace("lsh05222@yu.ac.kr", f"student-{index}@yu.ac.kr")
+            .replace("21/09/2026 22:09:36", f"2{index + 1}/09/2026 22:09:36")
+        )
+        if index:
+            fragment = fragment.replace("<html><body>", "")
+        if index < 2:
+            fragment = fragment.replace("</body></html>", "")
+        fragments.append(fragment)
+
+    parsed = parse_steel_challenge_email_many(html_body="".join(fragments))
+
+    assert len(parsed) == 3
+    assert [item[2]["source_run_index"] for item in parsed] == [1, 2, 3]
+    assert [item[0]["Run Information > User Id"] for item in parsed] == [
+        "student-0@yu.ac.kr",
+        "student-1@yu.ac.kr",
+        "student-2@yu.ac.kr",
+    ]

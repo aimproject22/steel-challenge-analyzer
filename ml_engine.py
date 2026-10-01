@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Optional
 
 import numpy as np
@@ -15,10 +16,40 @@ from sklearn.model_selection import train_test_split
 
 MIN_TRAINING_ROWS = 20
 SUPPORTED_TARGETS = ("Cost Per Tonne", "Score", "Time")
+MAX_MISSING_RATIO = 0.80
+REDUNDANCY_CORRELATION = 0.995
+
+OUTCOME_FEATURE_TOKENS = (
+    "within_spec",
+    "violation",
+    "steel_",
+    "slag_",
+    "tap_temperature",
+    "tapping_mass",
+    "total_energy",
+    "status",
+    "quality_",
+)
+RAW_FEATURE_TOKENS = ("raw_", "event_sequence", "unknown_events")
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
     return [column for column in df.columns if str(column).startswith("feature >")]
+
+
+def feature_role(column: str) -> str:
+    """Classify ML features without renaming the historical feature namespace."""
+
+    lowered = str(column).casefold().replace(" ", "_")
+    if any(token in lowered for token in RAW_FEATURE_TOKENS):
+        return "RAW"
+    if any(token in lowered for token in OUTCOME_FEATURE_TOKENS):
+        return "QUALITY_RESULT"
+    if any(token in lowered for token in ("cost", "score")):
+        return "OBJECTIVE"
+    if any(token in lowered for token in ("raw_material", "basket", "addition", "power_", "oxygen", "carbon")):
+        return "CONTROL_INPUT"
+    return "PROCESS_DERIVED"
 
 
 def _leakage_tokens(target_col: str) -> tuple[str, ...]:
@@ -41,10 +72,23 @@ def get_safe_feature_columns(df: pd.DataFrame, target_col: str) -> list[str]:
     result = []
     for column in get_feature_columns(df):
         lowered = str(column).casefold()
+        if feature_role(column) in {"RAW", "QUALITY_RESULT", "OBJECTIVE"}:
+            continue
         if any(token in lowered for token in tokens):
             continue
         result.append(column)
     return result
+
+
+def merged_run_mask(df: pd.DataFrame) -> pd.Series:
+    mask = pd.Series(False, index=df.index)
+    for column in df.columns:
+        if re.match(r"^Run Information > (?:User Id|Date|Status|Score)_\d+$", str(column)):
+            mask |= df[column].notna()
+    marker = "feature > quality_multi_run_merged_detected"
+    if marker in df:
+        mask |= pd.to_numeric(df[marker], errors="coerce").fillna(0).ne(0)
+    return mask
 
 
 def train_model(
@@ -60,6 +104,10 @@ def train_model(
     if target_col not in runs_df.columns:
         return None, None, None, {"error": f"{target_col} 컬럼이 없습니다."}
 
+    excluded_merged = int(merged_run_mask(runs_df).sum())
+    if excluded_merged:
+        runs_df = runs_df.loc[~merged_run_mask(runs_df)].copy()
+
     feature_cols = get_safe_feature_columns(runs_df, target_col)
     if not feature_cols:
         return None, None, None, {"error": "누출을 제외한 feature 컬럼이 없습니다."}
@@ -73,7 +121,12 @@ def train_model(
         return None, None, None, {"error": "유효한 학습 데이터가 부족합니다."}
 
     # Remove unusable features before splitting. No target values are consulted.
-    usable = [column for column in X.columns if X[column].notna().any()]
+    usable = [
+        column
+        for column in X.columns
+        if X[column].notna().any()
+        and X[column].isna().mean() <= MAX_MISSING_RATIO
+    ]
     X = X[usable]
     if X.empty:
         return None, None, None, {"error": "수치로 사용할 수 있는 feature가 없습니다."}
@@ -95,6 +148,19 @@ def train_model(
     X_test = X_test[non_constant]
     medians = medians[non_constant]
 
+    correlation = X_train.corr().abs()
+    redundant: set[str] = set()
+    for index, column in enumerate(non_constant):
+        if column in redundant:
+            continue
+        for other in non_constant[index + 1 :]:
+            if other not in redundant and correlation.loc[column, other] >= REDUNDANCY_CORRELATION:
+                redundant.add(other)
+    selected = [column for column in non_constant if column not in redundant]
+    X_train = X_train[selected]
+    X_test = X_test[selected]
+    medians = medians[selected]
+
     model = RandomForestRegressor(
         n_estimators=300,
         random_state=42,
@@ -112,16 +178,21 @@ def train_model(
         "RMSE": round(float(math.sqrt(mean_squared_error(y_test, prediction))), 4),
         "Train Count": len(X_train),
         "Test Count": len(X_test),
-        "Feature Count": len(non_constant),
+        "Feature Count": len(selected),
+        "Excluded Merged Runs": excluded_merged,
+        "Dropped Sparse Features": len(feature_cols) - len(usable),
+        "Dropped Redundant Features": len(redundant),
     }
+    if len(selected) > len(X_train) / 2:
+        metrics["warning"] = "현재 표본 수에 비해 feature가 많습니다."
     importance_df = pd.DataFrame(
-        {"Feature": non_constant, "Importance": model.feature_importances_}
+        {"Feature": selected, "Importance": model.feature_importances_}
     ).sort_values("Importance", ascending=False, ignore_index=True)
 
     # Store training preprocessing on the model so inference cannot recalculate it.
     model._steel_feature_medians = medians.to_dict()  # type: ignore[attr-defined]
     model._steel_target = target_col  # type: ignore[attr-defined]
-    return model, non_constant, importance_df, metrics
+    return model, selected, importance_df, metrics
 
 
 def train_score_model(runs_df: pd.DataFrame):

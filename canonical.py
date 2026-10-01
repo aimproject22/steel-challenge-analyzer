@@ -50,6 +50,34 @@ KEY_ALIASES = {
     "user id": "User Id",
 }
 
+RAW_MATERIAL_ALIASES = {
+    "no 1 bundles": "No1 Bundles",
+    "no1 bundles": "No1 Bundles",
+    "no1_bundles": "No1 Bundles",
+    "no 2 bundles": "No2 Bundles",
+    "no2 bundles": "No2 Bundles",
+    "no2_bundles": "No2 Bundles",
+    "direct reduced iron": "Direct Reduced Iron",
+    "dri": "Direct Reduced Iron",
+    "plate and structural": "Plate and Structural",
+    "plate & structural": "Plate and Structural",
+}
+
+ADDITION_ALIASES = {
+    "high c ferro manganese": "High C Ferro-Manganese",
+    "high c ferro-manganese": "High C Ferro-Manganese",
+    "hc femn": "High C Ferro-Manganese",
+    "low c ferro manganese": "Low C Ferro-Manganese",
+    "low c ferro-manganese": "Low C Ferro-Manganese",
+    "lc femn": "Low C Ferro-Manganese",
+    "ironoxide": "Iron Oxide",
+    "iron oxide": "Iron Oxide",
+    "ferro silicon 75": "Ferro-Silicon 75",
+    "ferro-silicon 75": "Ferro-Silicon 75",
+    "silico chromium": "Silico-Chromium",
+    "silico-chromium": "Silico-Chromium",
+}
+
 HEADER_WORDS = {
     "element",
     "current",
@@ -70,6 +98,15 @@ def normalize_text(value: Any) -> str:
 def normalize_key(value: Any) -> str:
     text = normalize_text(value)
     return KEY_ALIASES.get(text.casefold(), text)
+
+
+def normalize_material_name(value: Any, *, addition: bool = False) -> str:
+    """Normalize known material aliases while preserving unknown source names."""
+
+    text = normalize_text(value).replace("_", " ")
+    lookup_key = re.sub(r"\s+", " ", text).strip().casefold()
+    aliases = ADDITION_ALIASES if addition else RAW_MATERIAL_ALIASES
+    return aliases.get(lookup_key, text)
 
 
 def canonical_section(value: Any) -> Optional[str]:
@@ -226,4 +263,3 @@ def build_structured_sections(data: Mapping[str, Any]) -> Dict[str, Any]:
             }
         result[target_name] = section_result
     return result
-

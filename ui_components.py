@@ -31,7 +31,11 @@ from db_utils import (
     save_to_db,
     update_profile_permissions,
 )
-from excel_utils import make_excel
+from excel_utils import (
+    build_all_runs_export_df,
+    make_excel_from_frame,
+    summarize_export_frame,
+)
 from ml_engine import (
     estimate_model_uncertainty,
     generate_recommendations,
@@ -593,6 +597,12 @@ def render_ml(context: AuthContext) -> None:
     if metrics.get("error"):
         st.warning(metrics["error"])
         return
+    if metrics.get("warning"):
+        st.warning(metrics["warning"])
+    if metrics.get("Excluded Merged Runs"):
+        st.caption(
+            f"병합 의심 Run {int(metrics['Excluded Merged Runs'])}건을 학습에서 제외했습니다."
+        )
     frame = result["runs"]
     if _targets_nearly_equal(frame):
         st.warning(
@@ -704,7 +714,7 @@ def render_manual_upload(context: AuthContext) -> None:
 
 def _build_download(
     context: AuthContext, filters: Optional[Mapping[str, Any]]
-) -> tuple[bytes, int, int, str]:
+) -> tuple[bytes, int, int, str, dict[str, int]]:
     if not context.profile.get("public_access"):
         assert_can_download(context.client, str(context.user.id))
     runs = load_all_runs_df(context.client, filters=filters, max_rows=10000)
@@ -713,9 +723,17 @@ def _build_download(
         for value in runs.get("Run ID", pd.Series(dtype="int64")).dropna()
     ]
     logs = load_all_logs_df(context.client, run_ids=run_ids, max_rows=100000)
+    export_frame = build_all_runs_export_df(runs, logs)
+    summary = summarize_export_frame(export_frame)
     timestamp = datetime.now(SEOUL).strftime("%Y%m%d_%H%M%S")
     file_name = f"SteelChallenge_Master_{timestamp}.xlsx"
-    return make_excel(runs, logs).getvalue(), len(runs), len(logs), file_name
+    return (
+        make_excel_from_frame(export_frame).getvalue(),
+        len(runs),
+        len(logs),
+        file_name,
+        summary,
+    )
 
 
 def render_download(context: AuthContext) -> None:
@@ -737,7 +755,13 @@ def render_download(context: AuthContext) -> None:
                     st.session_state.pop("filtered_export", None)
                     st.error(str(exc))
         if "filtered_export" in st.session_state:
-            data, run_count, log_count, file_name = st.session_state["filtered_export"]
+            data, run_count, log_count, file_name, summary = st.session_state["filtered_export"]
+            st.caption(
+                f"{summary['columns']} columns · RM log 복원 {summary['rm_reconstructed']} · "
+                f"Addition log 복원 {summary['add_reconstructed']} · "
+                f"Cost mapping 경고 {summary['cost_mapping_warnings']} · "
+                f"병합 의심 {summary['merged_suspects']}"
+            )
             st.download_button(
                 f"현재 필터 다운로드 ({run_count} Runs / {log_count} Logs)",
                 data,
@@ -754,7 +778,13 @@ def render_download(context: AuthContext) -> None:
                     st.session_state.pop("full_export", None)
                     st.error(str(exc))
         if "full_export" in st.session_state:
-            data, run_count, log_count, file_name = st.session_state["full_export"]
+            data, run_count, log_count, file_name, summary = st.session_state["full_export"]
+            st.caption(
+                f"{summary['columns']} columns · RM report {summary['rm_report']} / "
+                f"log 복원 {summary['rm_reconstructed']} · Addition report {summary['add_report']} / "
+                f"log 복원 {summary['add_reconstructed']} · Cost mapping 경고 "
+                f"{summary['cost_mapping_warnings']} · 병합 의심 {summary['merged_suspects']}"
+            )
             st.download_button(
                 f"전체 다운로드 ({run_count} Runs / {log_count} Logs)",
                 data,
@@ -790,6 +820,32 @@ def render_data_quality(context: AuthContext) -> None:
     columns = st.columns(4) + st.columns(4)
     for column, (label, key) in zip(columns, labels):
         column.metric(label, f"{int(metrics.get(key) or 0):,}")
+
+    if st.button("Run 품질 진단 계산", use_container_width=True):
+        with st.spinner("Run과 Event Log를 교차 검증하는 중입니다..."):
+            runs = load_all_runs_df(context.client, max_rows=10000)
+            run_ids = [
+                int(value)
+                for value in runs.get("Run ID", pd.Series(dtype="int64")).dropna()
+            ]
+            logs = load_all_logs_df(context.client, run_ids=run_ids, max_rows=100000)
+            st.session_state["run_quality_summary"] = summarize_export_frame(
+                build_all_runs_export_df(runs, logs)
+            )
+    quality_summary = st.session_state.get("run_quality_summary")
+    if quality_summary:
+        quality_labels = [
+            ("병합 의심", "merged_suspects"),
+            ("RM report", "rm_report"),
+            ("RM log 복원", "rm_reconstructed"),
+            ("Addition report", "add_report"),
+            ("Addition log 복원", "add_reconstructed"),
+            ("Cost mapping 경고", "cost_mapping_warnings"),
+            ("경고 Run", "warning_runs"),
+            ("Export columns", "columns"),
+        ]
+        for column, (label, key) in zip(st.columns(4) + st.columns(4), quality_labels):
+            column.metric(label, f"{int(quality_summary.get(key) or 0):,}")
     emails = load_email_messages_df(context.client, user_id, limit=1000)
     st.markdown("#### 파싱 실패 이메일")
     if emails.empty or "parsed_status" not in emails:

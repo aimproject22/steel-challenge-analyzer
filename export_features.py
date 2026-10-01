@@ -12,7 +12,7 @@ import re
 from collections import deque
 from typing import Any, Iterable, Mapping, Optional
 
-from canonical import classify_event, normalize_event_log
+from canonical import classify_event, normalize_event_log, normalize_material_name
 
 
 RAW_CELL_CHUNK_SIZE = 30_000
@@ -31,8 +31,8 @@ CARBON_PATTERN = re.compile(
     r"\s*:?\s*\(?([-+]?\d[\d,]*(?:\.\d+)?)\s*(?:kg\s*/?\s*min)?",
     re.I,
 )
-MATERIAL_PATTERN = re.compile(
-    r"(?:^|;)\s*([^:;]+?)\s*:\s*([-+]?\d[\d,]*(?:\.\d+)?)\s*(kg|t)\b",
+MATERIAL_ITEM_PATTERN = re.compile(
+    r"^\s*(.+?)(?:\s*:\s*|\s+)([-+]?\d[\d,]*(?:\.\d+)?)\s*(kg|t)\s*$",
     re.I,
 )
 
@@ -143,11 +143,25 @@ def _integrate_setpoints(
     }
 
 
-def _parse_materials(text: str) -> list[tuple[str, float, str]]:
-    return [
-        (re.sub(r"\s+", " ", name).strip(), float(number.replace(",", "")), unit.casefold())
-        for name, number, unit in MATERIAL_PATTERN.findall(text)
-    ]
+def _parse_materials(
+    text: str, *, addition: bool = False
+) -> list[tuple[str, float, str]]:
+    """Parse colon or whitespace separated material amounts from one event."""
+
+    parsed: list[tuple[str, float, str]] = []
+    for part in str(text or "").split(";"):
+        match = MATERIAL_ITEM_PATTERN.match(part)
+        if not match:
+            continue
+        name, number, unit = match.groups()
+        parsed.append(
+            (
+                normalize_material_name(name, addition=addition),
+                float(number.replace(",", "")),
+                unit.casefold(),
+            )
+        )
+    return parsed
 
 
 def _compact_event(event: str) -> Optional[str]:
@@ -168,7 +182,7 @@ def _compact_event(event: str) -> Optional[str]:
         payload = " + ".join(f"{name} {value:g}{unit}" for name, value, unit in materials)
         return f"CHARGE[{payload or event}]"
     if "additions:" in lower:
-        materials = _parse_materials(event.split(":", 1)[1])
+        materials = _parse_materials(event.split(":", 1)[1], addition=True)
         payload = " + ".join(f"{name} {value:g}{unit}" for name, value, unit in materials)
         return f"ADD[{payload or event}]"
     if "analysis requested" in lower:
@@ -218,44 +232,38 @@ def extract_event_export_features(
     warnings: list[str] = []
 
     power = _integrate_setpoints(events, POWER_PATTERN, end_seconds)
+    has_power = bool(power["changes"])
     result.update(
         {
             "PWR_first_event_sec": power["first_event"],
             "PWR_first_on_sec": power["first_on"],
             "PWR_last_change_sec": power["last_change"],
-            "PWR_max_mw": power["max"],
+            "PWR_max_mw": power["max"] if has_power else None,
             "PWR_min_nonzero_mw": power["min_nonzero"],
             "PWR_change_count": power["change_count"],
-            "PWR_total_on_sec": power["on_seconds"],
-            "PWR_total_off_sec": power["off_seconds"],
+            "PWR_total_on_sec": power["on_seconds"] if has_power else None,
+            "PWR_total_off_sec": power["off_seconds"] if has_power else None,
             "PWR_time_weighted_avg_mw": power["weighted_average"],
-            "PWR_integrated_MW_sec": power["integrated"],
-            "PWR_integrated_MW_min": power["integrated"] / 60.0,
-            "PWR_estimated_mwh": power["integrated"] / 3600.0,
-            "PWR_energy_reported_kwh": _number(reported_energy_kwh),
-            "PWR_energy_estimated_kwh": power["integrated"] / 3.6,
+            "PWR_setpoint_integral_MW_sec": power["integrated"] if power["changes"] else None,
+            "PWR_setpoint_integral_MW_min": power["integrated"] / 60.0 if power["changes"] else None,
+            "PWR_setpoint_equivalent_MWh": power["integrated"] / 3600.0 if power["changes"] else None,
         }
-    )
-    reported_energy = _number(reported_energy_kwh)
-    result["PWR_energy_estimation_error_kwh"] = (
-        result["PWR_energy_estimated_kwh"] - reported_energy
-        if reported_energy is not None
-        else None
     )
     for value, duration in power["durations"].items():
         result[f"PWR_{value:g}MW_duration_sec"] = duration
 
     oxygen = _integrate_setpoints(events, OXYGEN_PATTERN, end_seconds)
+    has_oxygen = bool(oxygen["changes"])
     result.update(
         {
-            "O2_used": int(bool(oxygen["changes"])),
+            "O2_used": int(has_oxygen),
             "O2_first_on_sec": oxygen["first_on"],
             "O2_last_off_sec": oxygen["last_off"],
-            "O2_total_on_sec": oxygen["on_seconds"],
-            "O2_max_flow_Nm3_min": oxygen["max"],
+            "O2_total_on_sec": oxygen["on_seconds"] if has_oxygen else None,
+            "O2_max_flow_Nm3_min": oxygen["max"] if has_oxygen else None,
             "O2_time_weighted_avg_flow_Nm3_min": oxygen["weighted_average"],
             "O2_change_count": oxygen["change_count"],
-            "O2_integrated_Nm3": oxygen["integrated"] / 60.0,
+            "O2_integrated_Nm3": oxygen["integrated"] / 60.0 if has_oxygen else None,
         }
     )
 
@@ -266,15 +274,16 @@ def extract_event_export_features(
         and "addition" not in str(item.get("event") or "").casefold()
     ]
     carbon = _integrate_setpoints(carbon_events, CARBON_PATTERN, end_seconds)
+    has_carbon = bool(carbon["changes"])
     result.update(
         {
-            "CINJ_used": int(bool(carbon["changes"])),
+            "CINJ_used": int(has_carbon),
             "CINJ_first_on_sec": carbon["first_on"],
             "CINJ_last_off_sec": carbon["last_off"],
-            "CINJ_total_on_sec": carbon["on_seconds"],
-            "CINJ_max_flow": carbon["max"],
+            "CINJ_total_on_sec": carbon["on_seconds"] if has_carbon else None,
+            "CINJ_max_flow": carbon["max"] if has_carbon else None,
             "CINJ_time_weighted_avg_flow": carbon["weighted_average"],
-            "CINJ_integrated_kg": carbon["integrated"] / 60.0,
+            "CINJ_integrated_kg": carbon["integrated"] / 60.0 if has_carbon else None,
             "CINJ_change_count": carbon["change_count"],
         }
     )
@@ -313,16 +322,24 @@ def extract_event_export_features(
             result[f"BASKET_{basket_index}_time_min"] = seconds / 60.0
             materials = _parse_materials(event.split(":", 1)[1] if ":" in event else event)
             mass = 0.0
+            basket_materials: dict[str, float] = {}
             for name, value, unit in materials:
                 tonnes = value if unit == "t" else value / 1000.0
                 mass += tonnes
-                result[f"BASKET_{basket_index}_{export_token(name)}_t"] = tonnes
+                basket_materials[name] = basket_materials.get(name, 0.0) + tonnes
+            for name, tonnes in basket_materials.items():
+                token = export_token(name)
+                result[f"BASKET_{basket_index}_{token}_t"] = tonnes
+                total_key = f"BASKET_{token}_total_t"
+                result[total_key] = result.get(total_key, 0.0) + tonnes
             result[f"BASKET_{basket_index}_mass_t"] = mass
             basket_total += mass
 
         if "additions:" in lower and seconds is not None:
             addition_times.append(seconds)
-            for name, amount, unit in _parse_materials(event.split(":", 1)[1]):
+            for name, amount, unit in _parse_materials(
+                event.split(":", 1)[1], addition=True
+            ):
                 addition_by_name.setdefault(name, []).append(seconds)
                 amount_kg = amount * 1000.0 if unit == "t" else amount
                 addition_amounts[name] = addition_amounts.get(name, 0.0) + amount_kg

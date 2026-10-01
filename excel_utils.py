@@ -12,6 +12,7 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from canonical import normalize_material_name
 from export_features import export_token, extract_event_export_features
 
 
@@ -37,15 +38,29 @@ CORE_PERF_COLUMNS = [
 CORE_COST_COLUMNS = [
     "COST_power_raw", "COST_scrap_raw", "COST_additions_raw",
     "COST_other_consumables_raw", "COST_total_usd", "COST_per_tonne_usd",
-    "COST_scrap_calc_usd", "COST_additions_calc_usd",
-    "COST_electricity_calc_usd", "COST_reconstructed_total_usd",
+    "COST_power_corrected_usd", "COST_scrap_corrected_usd",
+    "COST_additions_corrected_usd", "COST_other_corrected_usd",
+    "COST_reconstructed_total_usd",
     "COST_reconciliation_error_usd", "COST_reconciliation_error_pct",
+    "COST_detected_power_source", "COST_detected_scrap_source",
+    "COST_detected_additions_source", "COST_detected_other_source",
+    "COST_label_mismatch_detected", "COST_mapping_confidence",
+    "COST_mapping_warning",
 ]
 CORE_QUALITY_COLUMNS = [
-    "QUALITY_overall_pass", "QUALITY_steel_pass",
+    "QUALITY_overall_pass", "QUALITY_full_validation_available",
+    "QUALITY_chemistry_pass", "QUALITY_steel_pass",
     "QUALITY_steel_violation_count", "QUALITY_slag_pass",
     "QUALITY_slag_violation_count", "QUALITY_temperature_pass",
-    "QUALITY_time_pass", "QUALITY_mass_pass", "QUALITY_status_consistent",
+    "QUALITY_time_pass", "QUALITY_mass_pass", "QUALITY_co2_pass",
+    "QUALITY_status_consistent", "QUALITY_status_matches_chemistry",
+    "QUALITY_multi_run_merged_detected",
+    "QUALITY_rm_source", "QUALITY_rm_report_log_match",
+    "QUALITY_rm_reconstruction_warning", "QUALITY_rm_total_report_t",
+    "QUALITY_rm_total_log_t", "QUALITY_rm_total_difference_t",
+    "QUALITY_add_source", "QUALITY_add_report_log_match",
+    "QUALITY_add_reconstruction_warning", "QUALITY_add_total_report_kg",
+    "QUALITY_add_total_log_kg", "QUALITY_add_total_difference_kg",
     "QUALITY_unknown_event_count", "QUALITY_warning_count",
     "QUALITY_warning_text",
 ]
@@ -165,8 +180,32 @@ def _section_values(
     return values, warnings
 
 
+def _normalize_section_materials(
+    values: Mapping[str, Any], *, addition: bool
+) -> tuple[dict[str, Any], list[str]]:
+    normalized: dict[str, Any] = {}
+    warnings: list[str] = []
+    for raw_name, value in values.items():
+        name = normalize_material_name(raw_name, addition=addition)
+        if name not in normalized:
+            normalized[name] = value
+            continue
+        previous = _number(normalized[name])
+        current = _number(value)
+        if previous is not None and current is not None:
+            normalized[name] = previous + current
+            warnings.append(f"Summed duplicate material {name}")
+        elif str(normalized[name]) != str(value):
+            warnings.append(
+                f"Conflicting duplicate material {name}: kept {normalized[name]!r}"
+            )
+    return normalized, warnings
+
+
 def build_material_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     values, warnings = _section_values(row, "Raw Materials")
+    values, alias_warnings = _normalize_section_materials(values, addition=False)
+    warnings.extend(alias_warnings)
     result: dict[str, Any] = {}
     numeric: list[float] = []
     nonzero = 0
@@ -183,6 +222,8 @@ def build_material_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], list
 
 def build_addition_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     values, warnings = _section_values(row, "Additions")
+    values, alias_warnings = _normalize_section_materials(values, addition=True)
+    warnings.extend(alias_warnings)
     result: dict[str, Any] = {}
     numeric: list[float] = []
     nonzero = 0
@@ -242,8 +283,10 @@ def _composition_columns(
             else (f"{token}_wt_pct" if prefix == "STEEL_" else f"{token}_pct")
         )
         result[f"{prefix}{current_suffix}"] = current
-        result[f"{prefix}{token}_min"] = minimum
-        result[f"{prefix}{token}_max"] = maximum
+        has_spec = minimum is not None or maximum is not None
+        if has_spec:
+            result[f"{prefix}{token}_min"] = minimum
+            result[f"{prefix}{token}_max"] = maximum
         if current is None or (minimum is None and maximum is None):
             within = None
         else:
@@ -253,18 +296,21 @@ def _composition_columns(
             )
             pass_values.append(within)
             violations += int(not within)
-        result[f"{prefix}{token}_pass"] = within
-        result[f"{prefix}{token}_margin_low"] = (
-            current - minimum if current is not None and minimum is not None else None
-        )
-        result[f"{prefix}{token}_margin_high"] = (
-            maximum - current if current is not None and maximum is not None else None
-        )
-        result[f"{prefix}{token}_normalized_position"] = (
-            (current - minimum) / (maximum - minimum)
-            if current is not None and minimum is not None and maximum is not None
-            and maximum != minimum else None
-        )
+        if has_spec:
+            result[f"{prefix}{token}_pass"] = within
+            if minimum is not None:
+                result[f"{prefix}{token}_margin_low"] = (
+                    current - minimum if current is not None else None
+                )
+            if maximum is not None:
+                result[f"{prefix}{token}_margin_high"] = (
+                    maximum - current if current is not None else None
+                )
+            if minimum is not None and maximum is not None:
+                result[f"{prefix}{token}_normalized_position"] = (
+                    (current - minimum) / (maximum - minimum)
+                    if current is not None and maximum != minimum else None
+                )
     overall = int(all(pass_values)) if pass_values else None
     return result, overall, violations
 
@@ -347,9 +393,10 @@ def _base_export_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "COST_other_consumables_raw": _number(_value(row, "Cost Breakdown > Other consumables")),
         "COST_total_usd": total_cost,
         "COST_per_tonne_usd": cost_per_tonne,
-        "COST_scrap_calc_usd": None,
-        "COST_additions_calc_usd": None,
-        "COST_electricity_calc_usd": None,
+        "COST_power_corrected_usd": None,
+        "COST_scrap_corrected_usd": None,
+        "COST_additions_corrected_usd": None,
+        "COST_other_corrected_usd": None,
         "COST_reconstructed_total_usd": None,
         "COST_reconciliation_error_usd": None,
         "COST_reconciliation_error_pct": None,
@@ -364,6 +411,292 @@ def _base_export_row(row: Mapping[str, Any]) -> dict[str, Any]:
         total_cost / tapping_mass if total_cost is not None and tapping_mass not in (None, 0) else None
     )
     return result
+
+
+def _nearly_equal(left: Any, right: Any, *, absolute: float = 0.01) -> bool:
+    first = _number(left)
+    second = _number(right)
+    if first is None or second is None:
+        return False
+    return abs(first - second) <= max(absolute, 1e-4 * max(abs(first), abs(second)))
+
+
+def apply_cost_validation(export_row: dict[str, Any]) -> list[str]:
+    """Validate report labels without inventing material or electricity prices."""
+
+    power = _number(export_row.get("COST_power_raw"))
+    scrap = _number(export_row.get("COST_scrap_raw"))
+    additions = _number(export_row.get("COST_additions_raw"))
+    other = _number(export_row.get("COST_other_consumables_raw"))
+    total = _number(export_row.get("COST_total_usd"))
+    process_time = _number(export_row.get("PERF_time_min"))
+    warnings: list[str] = []
+    if all(value is None for value in (power, scrap, additions, other, total)):
+        export_row.update(
+            {
+                "COST_label_mismatch_detected": None,
+                "COST_mapping_confidence": "MISSING",
+                "COST_mapping_warning": None,
+            }
+        )
+        return warnings
+    time_collision = scrap is not None and _nearly_equal(scrap, process_time)
+    meaningful = [value for value in (power, additions, other) if value is not None]
+    residual = total - sum(meaningful) if total is not None and len(meaningful) == 3 else None
+
+    if (
+        time_collision
+        and len(meaningful) == 3
+        and total is not None
+        and residual is not None
+        and residual >= -max(1.0, abs(total) * 0.001)
+        and residual <= max(1_000.0, abs(total) * 0.10)
+    ):
+        if _nearly_equal(residual, 0.0, absolute=0.1):
+            residual = 0.0
+        corrected = {
+            "COST_power_corrected_usd": other,
+            "COST_scrap_corrected_usd": additions,
+            "COST_additions_corrected_usd": power,
+            "COST_other_corrected_usd": residual,
+            "COST_detected_power_source": "Cost Breakdown > Other consumables",
+            "COST_detected_scrap_source": "Cost Breakdown > Additions",
+            "COST_detected_additions_source": "Cost Breakdown > Power",
+            "COST_detected_other_source": "TOTAL_RESIDUAL",
+            "COST_label_mismatch_detected": 1,
+            "COST_mapping_confidence": (
+                "HIGH_INTERNAL_RECONCILIATION"
+                if abs(residual) <= max(1.0, abs(total) * 0.001)
+                else "MEDIUM_TOTAL_RESIDUAL"
+            ),
+            "COST_mapping_warning": (
+                "Report cost labels appear shifted; Scrap raw equals process time. "
+                "Corrected mapping uses the report total residual and no invented prices."
+            ),
+        }
+        warnings.append("Cost label mismatch detected and internally reconciled")
+    else:
+        all_raw = [value for value in (power, scrap, additions, other) if value is not None]
+        if (
+            len(all_raw) == 4
+            and total is not None
+            and _nearly_equal(sum(all_raw), total, absolute=0.1)
+        ):
+            corrected = {
+                "COST_power_corrected_usd": power,
+                "COST_scrap_corrected_usd": scrap,
+                "COST_additions_corrected_usd": additions,
+                "COST_other_corrected_usd": other,
+                "COST_detected_power_source": "Cost Breakdown > Power",
+                "COST_detected_scrap_source": "Cost Breakdown > Scrap",
+                "COST_detected_additions_source": "Cost Breakdown > Additions",
+                "COST_detected_other_source": "Cost Breakdown > Other consumables",
+                "COST_label_mismatch_detected": 0,
+                "COST_mapping_confidence": "REPORT_TOTAL_RECONCILED",
+                "COST_mapping_warning": None,
+            }
+        else:
+            corrected = {
+                "COST_label_mismatch_detected": int(time_collision),
+                "COST_mapping_confidence": "UNRESOLVED",
+                "COST_mapping_warning": (
+                    "Scrap raw equals process time; corrected costs left blank"
+                    if time_collision
+                    else "Cost labels could not be independently validated"
+                ),
+            }
+            warnings.append(str(corrected["COST_mapping_warning"]))
+
+    export_row.update(corrected)
+    corrected_values = [
+        _number(export_row.get(column))
+        for column in (
+            "COST_power_corrected_usd",
+            "COST_scrap_corrected_usd",
+            "COST_additions_corrected_usd",
+            "COST_other_corrected_usd",
+        )
+    ]
+    if all(value is not None for value in corrected_values):
+        reconstructed = sum(value for value in corrected_values if value is not None)
+        export_row["COST_reconstructed_total_usd"] = reconstructed
+        if total is not None:
+            error = reconstructed - total
+            export_row["COST_reconciliation_error_usd"] = error
+            export_row["COST_reconciliation_error_pct"] = (
+                error / total * 100.0 if total != 0 else None
+            )
+    return warnings
+
+
+def _detail_values(
+    values: Mapping[str, Any], prefix: str, suffix: str, excluded: set[str]
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for column, value in values.items():
+        if not str(column).startswith(prefix) or not str(column).endswith(suffix):
+            continue
+        if column in excluded:
+            continue
+        number = _number(value)
+        if number is not None:
+            token = str(column)[len(prefix) : -len(suffix)]
+            result[token] = result.get(token, 0.0) + number
+    return result
+
+
+def _material_match(report: Mapping[str, float], logged: Mapping[str, float]) -> bool:
+    if not report or not logged:
+        return False
+    for name in set(report) | set(logged):
+        if not _nearly_equal(report.get(name, 0.0), logged.get(name, 0.0), absolute=0.01):
+            return False
+    return True
+
+
+def apply_material_fallbacks(export_row: dict[str, Any]) -> list[str]:
+    """Prefer report tables, otherwise reconstruct material totals from events."""
+
+    warnings: list[str] = []
+    report_rm = _detail_values(
+        export_row,
+        "RM_",
+        "_t",
+        {"RM_total_mass_t"},
+    )
+    logged_rm = _detail_values(export_row, "BASKET_", "_total_t", set())
+    report_add = _detail_values(
+        export_row,
+        "ADD_",
+        "_kg",
+        {"ADD_total_kg"},
+    )
+    logged_add = _detail_values(export_row, "EVTADD_", "_total_kg", set())
+
+    rm_report_total = sum(report_rm.values()) if report_rm else None
+    rm_log_total = sum(logged_rm.values()) if logged_rm else None
+    add_report_total = sum(report_add.values()) if report_add else None
+    add_log_total = sum(logged_add.values()) if logged_add else None
+    export_row.update(
+        {
+            "QUALITY_rm_total_report_t": rm_report_total,
+            "QUALITY_rm_total_log_t": rm_log_total,
+            "QUALITY_rm_total_difference_t": (
+                rm_report_total - rm_log_total
+                if rm_report_total is not None and rm_log_total is not None else None
+            ),
+            "QUALITY_add_total_report_kg": add_report_total,
+            "QUALITY_add_total_log_kg": add_log_total,
+            "QUALITY_add_total_difference_kg": (
+                add_report_total - add_log_total
+                if add_report_total is not None and add_log_total is not None else None
+            ),
+        }
+    )
+
+    if report_rm:
+        match = _material_match(report_rm, logged_rm) if logged_rm else None
+        export_row["QUALITY_rm_source"] = (
+            "REPORT_AND_LOG_VERIFIED" if match else "REPORT"
+        )
+        export_row["QUALITY_rm_report_log_match"] = int(match) if match is not None else None
+        if match is False:
+            export_row["QUALITY_rm_reconstruction_warning"] = "Report and Event Log RM differ"
+            warnings.append("Raw Materials report/log mismatch")
+    elif logged_rm:
+        for token, value in logged_rm.items():
+            export_row[f"RM_{token}_t"] = value
+        export_row["RM_total_mass_t"] = rm_log_total
+        export_row["RM_nonzero_material_count"] = sum(value != 0 for value in logged_rm.values())
+        export_row["QUALITY_rm_source"] = "EVENT_LOG_RECONSTRUCTED"
+        export_row["QUALITY_rm_reconstruction_warning"] = "Report RM missing; reconstructed from Event Log"
+    else:
+        export_row["QUALITY_rm_source"] = "MISSING"
+        export_row["QUALITY_rm_reconstruction_warning"] = "Raw Materials unavailable"
+        warnings.append("Raw Materials missing")
+
+    if report_add:
+        match = _material_match(report_add, logged_add) if logged_add else None
+        export_row["QUALITY_add_source"] = (
+            "REPORT_AND_LOG_VERIFIED" if match else "REPORT"
+        )
+        export_row["QUALITY_add_report_log_match"] = int(match) if match is not None else None
+        if match is False:
+            export_row["QUALITY_add_reconstruction_warning"] = "Report and Event Log additions differ"
+            warnings.append("Additions report/log mismatch")
+    elif logged_add:
+        for token, value in logged_add.items():
+            export_row[f"ADD_{token}_kg"] = value
+        export_row["ADD_total_kg"] = add_log_total
+        export_row["ADD_nonzero_count"] = sum(value != 0 for value in logged_add.values())
+        export_row["QUALITY_add_source"] = "EVENT_LOG_RECONSTRUCTED"
+        export_row["QUALITY_add_reconstruction_warning"] = "Report additions missing; reconstructed from Event Log"
+    else:
+        export_row["QUALITY_add_source"] = "MISSING"
+        export_row["QUALITY_add_reconstruction_warning"] = "Additions unavailable"
+    return warnings
+
+
+def detect_multi_run_merged(row: Mapping[str, Any], logs: Iterable[Mapping[str, Any]]) -> bool:
+    duplicate_fields = any(
+        COMPOSITE_RUN_KEY_RE.match(str(key)) and not _is_missing(value)
+        for key, value in row.items()
+    )
+    ordered = sorted(
+        list(logs),
+        key=lambda item: int(_number(item.get("log_no")) or 0),
+    )
+    events = [str(item.get("event") or "").casefold() for item in ordered]
+    tapping_seen = False
+    clock_reset = False
+    tapping_seconds: Optional[float] = None
+    for item, event in zip(ordered, events):
+        seconds = _number(item.get("event_seconds"))
+        if seconds is None:
+            time_text = str(item.get("event_time") or item.get("time") or "")
+            parts = time_text.split(":")
+            try:
+                seconds = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            except (IndexError, TypeError, ValueError):
+                seconds = None
+        if tapping_seen and seconds is not None and tapping_seconds is not None:
+            if seconds < tapping_seconds:
+                clock_reset = True
+        if "tapping complete" in event:
+            tapping_seen = True
+            tapping_seconds = seconds
+    return bool(
+        duplicate_fields
+        or sum("tapping complete" in event for event in events) > 1
+        or sum("selected steel grade" in event for event in events) > 1
+        or clock_reset
+    )
+
+
+def drop_all_null_export_columns(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    if frame.empty:
+        return frame, []
+    null_columns = [
+        column
+        for column in frame.columns
+        if frame[column].map(_is_missing).all()
+    ]
+    return frame.drop(columns=null_columns), null_columns
+
+
+def drop_redundant_export_columns(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Drop only known presentation duplicates that are identical for all runs."""
+
+    pairs = (
+        ("PERF_score", "META_score"),
+        ("PWR_energy_reported_kwh", "PERF_total_energy_kwh"),
+        ("META_uploader", "META_sender"),
+    )
+    dropped: list[str] = []
+    for candidate, retained in pairs:
+        if candidate in frame and retained in frame and frame[candidate].equals(frame[retained]):
+            dropped.append(candidate)
+    return frame.drop(columns=dropped), dropped
 
 
 def _column_order(columns: Iterable[str]) -> list[str]:
@@ -403,24 +736,10 @@ def build_all_runs_export_df(
     records: list[dict[str, Any]] = []
     source_runs = runs_df if runs_df is not None else pd.DataFrame()
     source_records = source_runs.to_dict("records")
-    composite_run_ids = [
-        _value(row, "Run ID", "id")
-        for row in source_records
-        if any(
-            COMPOSITE_RUN_KEY_RE.match(str(key)) and not _is_missing(value)
-            for key, value in row.items()
-        )
-    ]
-    if composite_run_ids:
-        listed = ", ".join(str(value) for value in composite_run_ids)
-        raise ValueError(
-            "여러 실행 결과가 한 DB 행에 합쳐진 Run이 있어 Excel을 안전하게 "
-            f"생성할 수 없습니다. Gmail 재처리 대상 Run ID: {listed}"
-        )
-
     for row in source_records:
         export_row = _base_export_row(row)
         warnings: list[str] = []
+        warnings.extend(apply_cost_validation(export_row))
         materials, material_warnings = build_material_columns(row)
         additions, addition_warnings = build_addition_columns(row)
         steel, steel_pass, steel_violations = build_steel_columns(row)
@@ -436,6 +755,10 @@ def build_all_runs_export_df(
         event_features = build_event_export_features(run_logs, row)
         warnings.extend(event_features.pop("_warnings", []))
         export_row.update(event_features)
+        warnings.extend(apply_material_fallbacks(export_row))
+        merged = int(detect_multi_run_merged(row, run_logs))
+        if merged:
+            warnings.append("Multiple simulation runs may be merged in this DB record")
         export_row.update({
             "QUALITY_steel_pass": steel_pass,
             "QUALITY_steel_violation_count": steel_violations,
@@ -444,13 +767,19 @@ def build_all_runs_export_df(
             "QUALITY_temperature_pass": None,
             "QUALITY_time_pass": None,
             "QUALITY_mass_pass": None,
+            "QUALITY_co2_pass": None,
+            "QUALITY_full_validation_available": 0,
+            "QUALITY_multi_run_merged_detected": merged,
         })
         known_quality = [value for value in (steel_pass, slag_pass) if value is not None]
-        overall = int(all(known_quality)) if known_quality else None
-        export_row["QUALITY_overall_pass"] = overall
+        chemistry = int(all(known_quality)) if known_quality else None
+        export_row["QUALITY_chemistry_pass"] = chemistry
+        export_row["QUALITY_overall_pass"] = None
         status = _number(export_row.get("META_status"))
-        export_row["QUALITY_status_consistent"] = (
-            int(status == overall) if status is not None and overall is not None else None
+        export_row["QUALITY_status_consistent"] = None
+        export_row["QUALITY_status_matches_chemistry"] = (
+            int(status == chemistry)
+            if status is not None and chemistry is not None else None
         )
         if not run_logs:
             warnings.append("Event Log missing")
@@ -463,6 +792,9 @@ def build_all_runs_export_df(
         frame = pd.DataFrame(
             columns=CORE_META_COLUMNS + CORE_PERF_COLUMNS + CORE_COST_COLUMNS + CORE_QUALITY_COLUMNS
         )
+        return frame
+    frame, _ = drop_all_null_export_columns(frame)
+    frame, _ = drop_redundant_export_columns(frame)
     return frame.reindex(columns=_column_order(frame.columns))
 
 
@@ -509,15 +841,25 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
             for cell in worksheet[letter][1:]:
                 cell.alignment = Alignment(vertical="center", wrap_text=False)
 
-    for prefix in GROUP_PREFIXES:
-        indexes = [
-            index for index, column in enumerate(frame.columns, start=1)
-            if column.startswith(prefix)
-        ]
-        if indexes:
-            for index in range(min(indexes), max(indexes) + 1):
-                worksheet.column_dimensions[get_column_letter(index)].outlineLevel = 1
-                worksheet.column_dimensions[get_column_letter(index)].hidden = False
+    def detail_column(column: str) -> bool:
+        if column.startswith(("EVTADD_", "ANALYSIS_", "DERIVED_", "RAW_")):
+            return True
+        if column.startswith(("STEEL_", "SLAG_")):
+            return column.endswith(
+                ("_min", "_max", "_pass", "_margin_low", "_margin_high", "_normalized_position")
+            )
+        if column.startswith("BASKET_"):
+            return bool(re.match(r"^BASKET_\d+_.+_t$", column))
+        if column.startswith("PWR_"):
+            return column.endswith("MW_duration_sec")
+        return False
+
+    for index, column in enumerate(frame.columns, start=1):
+        if detail_column(str(column)):
+            dimension = worksheet.column_dimensions[get_column_letter(index)]
+            dimension.outlineLevel = 1
+            dimension.hidden = True
+            dimension.collapsed = False
 
     green = PatternFill("solid", fgColor="DCFCE7")
     red = PatternFill("solid", fgColor="FEE2E2")
@@ -532,6 +874,11 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
                 target, CellIsRule(operator="equal", formula=["0"], fill=red)
             )
 
+        if column in {"COST_per_tonne_usd", "PERF_time_min", "PERF_total_energy_kwh"}:
+            letter = get_column_letter(index)
+            for cell in worksheet[letter][1:]:
+                cell.number_format = '#,##0.00'
+
 
 def make_excel(
     runs_df: pd.DataFrame,
@@ -539,9 +886,55 @@ def make_excel(
     ml_features_df: Optional[pd.DataFrame] = None,
 ) -> BytesIO:
     all_runs = build_all_runs_export_df(runs_df, logs_df, ml_features_df)
+    return make_excel_from_frame(all_runs)
+
+
+def make_excel_from_frame(all_runs: pd.DataFrame) -> BytesIO:
+    """Serialize one already-built ALL_RUNS frame without rebuilding features."""
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         clean_dataframe_for_excel(all_runs).to_excel(writer, sheet_name="ALL_RUNS", index=False)
         apply_excel_formatting(writer, all_runs)
     output.seek(0)
     return output
+
+
+def summarize_export_frame(frame: pd.DataFrame) -> dict[str, int]:
+    def count_equals(column: str, value: str) -> int:
+        if column not in frame:
+            return 0
+        return int(frame[column].fillna("").astype(str).eq(value).sum())
+
+    return {
+        "runs": len(frame),
+        "columns": len(frame.columns),
+        "merged_suspects": int(
+            pd.to_numeric(
+                frame.get("QUALITY_multi_run_merged_detected", pd.Series(dtype=float)),
+                errors="coerce",
+            ).fillna(0).sum()
+        ),
+        "rm_report": count_equals("QUALITY_rm_source", "REPORT")
+        + count_equals("QUALITY_rm_source", "REPORT_AND_LOG_VERIFIED"),
+        "rm_reconstructed": count_equals(
+            "QUALITY_rm_source", "EVENT_LOG_RECONSTRUCTED"
+        ),
+        "add_report": count_equals("QUALITY_add_source", "REPORT")
+        + count_equals("QUALITY_add_source", "REPORT_AND_LOG_VERIFIED"),
+        "add_reconstructed": count_equals(
+            "QUALITY_add_source", "EVENT_LOG_RECONSTRUCTED"
+        ),
+        "cost_mapping_warnings": int(
+            pd.to_numeric(
+                frame.get("COST_label_mismatch_detected", pd.Series(dtype=float)),
+                errors="coerce",
+            ).fillna(0).sum()
+        ),
+        "warning_runs": int(
+            pd.to_numeric(
+                frame.get("QUALITY_warning_count", pd.Series(dtype=float)),
+                errors="coerce",
+            ).fillna(0).gt(0).sum()
+        ),
+    }
