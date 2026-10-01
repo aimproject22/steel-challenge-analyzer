@@ -77,6 +77,7 @@ def build_run_payload(
     sender_name: Optional[str] = None,
     sender_email: Optional[str] = None,
     email_message_id: Optional[int] = None,
+    source_run_index: int = 1,
 ) -> tuple[dict, list[dict]]:
     normalized_logs = [
         normalize_event_log(log, index)
@@ -89,6 +90,7 @@ def build_run_payload(
 
     run_payload = {
         "email_message_id": email_message_id,
+        "source_run_index": max(1, int(source_run_index)),
         "source": source,
         "sender_name": sender_name or uploader,
         "sender_email": sender_email,
@@ -131,6 +133,7 @@ def save_to_db(
     sender_name: Optional[str] = None,
     sender_email: Optional[str] = None,
     email_message_id: Optional[int] = None,
+    source_run_index: int = 1,
 ) -> int:
     """Save one run and its logs atomically through the database function."""
 
@@ -145,6 +148,7 @@ def save_to_db(
         sender_name=sender_name,
         sender_email=sender_email,
         email_message_id=email_message_id,
+        source_run_index=source_run_index,
     )
     response = client.rpc(
         "save_run_with_logs",
@@ -158,6 +162,53 @@ def save_to_db(
     if result is None:
         raise RuntimeError("Supabase run/log 저장에 실패했습니다.")
     return int(result)
+
+
+def replace_email_runs_with_logs(
+    client: Any,
+    email_message_id: int,
+    entries: Sequence[Mapping[str, Any]],
+) -> list[int]:
+    """Atomically replace every parsed run belonging to one Gmail message."""
+
+    if client is None:
+        raise ValueError("Supabase service client가 필요합니다.")
+    if not entries:
+        raise ValueError("저장할 Gmail Run이 없습니다.")
+    payload = []
+    for entry in entries:
+        run_payload = dict(entry.get("run_payload") or {})
+        log_payload = list(entry.get("log_payload") or [])
+        run_payload["email_message_id"] = int(email_message_id)
+        payload.append(
+            {
+                "run_payload": _json_safe(run_payload),
+                "log_payload": _json_safe(log_payload),
+            }
+        )
+    response = client.rpc(
+        "replace_email_runs_with_logs",
+        {
+            "p_email_message_id": int(email_message_id),
+            "run_entries": payload,
+        },
+    ).execute()
+    result = response.data
+    if isinstance(result, list) and len(result) == 1:
+        if isinstance(result[0], Mapping):
+            result = (
+                result[0].get("replace_email_runs_with_logs")
+                or result[0].get("ids")
+            )
+        elif isinstance(result[0], list):
+            result = result[0]
+    if isinstance(result, Mapping):
+        result = result.get("replace_email_runs_with_logs") or result.get("ids")
+    if isinstance(result, str):
+        result = [item for item in result.strip("{}").split(",") if item]
+    if not isinstance(result, list) or not result:
+        raise RuntimeError("Supabase Gmail Run 일괄 저장에 실패했습니다.")
+    return [int(item) for item in result]
 
 
 def _fallback(data: Mapping[str, Any], direct: str, flat: str) -> Any:
@@ -175,6 +226,7 @@ def _run_row_to_display(row: Mapping[str, Any]) -> dict:
         "Run Date": _fallback(row, "run_date", "Run Information > Date"),
         "Uploaded At": row.get("uploaded_at") or row.get("created_at"),
         "Source": row.get("source") or "docx",
+        "Source Run Index": row.get("source_run_index") or 1,
         "Sender": row.get("sender_name") or row.get("uploader"),
         "Sender Email": row.get("sender_email"),
         "Steel User ID": _fallback(row, "steel_user_id", "Run Information > User Id"),
@@ -450,6 +502,38 @@ def get_email_message_by_gmail_id(client: Any, gmail_message_id: str) -> Optiona
         .execute()
     )
     return dict(response.data[0]) if response.data else None
+
+
+def get_email_messages_for_run_ids(
+    client: Any, run_ids: Sequence[int]
+) -> list[dict]:
+    """Resolve stored Run IDs to their source Gmail message rows."""
+
+    normalized = sorted({int(value) for value in run_ids})
+    if not normalized:
+        return []
+    run_response = (
+        client.table("runs")
+        .select("email_message_id")
+        .in_("id", normalized)
+        .execute()
+    )
+    email_ids = sorted(
+        {
+            int(row["email_message_id"])
+            for row in (run_response.data or [])
+            if row.get("email_message_id") is not None
+        }
+    )
+    if not email_ids:
+        return []
+    response = (
+        client.table("email_messages")
+        .select("*")
+        .in_("id", email_ids)
+        .execute()
+    )
+    return [dict(row) for row in (response.data or [])]
 
 
 def create_email_message(client: Any, metadata: Mapping[str, Any]) -> dict:

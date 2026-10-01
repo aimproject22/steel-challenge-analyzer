@@ -17,9 +17,13 @@ from export_features import export_token, extract_event_export_features
 
 ILLEGAL_EXCEL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 DUPLICATE_SUFFIX_RE = re.compile(r"_(\d+)$")
+COMPOSITE_RUN_KEY_RE = re.compile(
+    r"^Run Information > (?:User Id|Date|Status|Score)_\d+$"
+)
 
 CORE_META_COLUMNS = [
     "META_run_id", "META_run_date", "META_uploaded_at", "META_source",
+    "META_source_run_index",
     "META_sender", "META_sender_email", "META_steel_user_id",
     "META_process_type", "META_uploader", "META_file_name", "META_status",
     "META_score", "META_user_level", "META_steel_grade",
@@ -312,6 +316,9 @@ def _base_export_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "META_run_date": _value(row, "Run Date", "Run Information > Date"),
         "META_uploaded_at": _value(row, "Uploaded At", "uploaded_at", "created_at"),
         "META_source": _value(row, "Source", "source"),
+        "META_source_run_index": _number(
+            _value(row, "Source Run Index", "source_run_index")
+        ),
         "META_sender": _value(row, "Sender", "sender_name"),
         "META_sender_email": _value(row, "Sender Email", "sender_email"),
         "META_steel_user_id": _value(row, "Steel User ID", "Run Information > User Id"),
@@ -395,7 +402,23 @@ def build_all_runs_export_df(
     log_groups = aggregate_logs_by_run(logs_df)
     records: list[dict[str, Any]] = []
     source_runs = runs_df if runs_df is not None else pd.DataFrame()
-    for row in source_runs.to_dict("records"):
+    source_records = source_runs.to_dict("records")
+    composite_run_ids = [
+        _value(row, "Run ID", "id")
+        for row in source_records
+        if any(
+            COMPOSITE_RUN_KEY_RE.match(str(key)) and not _is_missing(value)
+            for key, value in row.items()
+        )
+    ]
+    if composite_run_ids:
+        listed = ", ".join(str(value) for value in composite_run_ids)
+        raise ValueError(
+            "여러 실행 결과가 한 DB 행에 합쳐진 Run이 있어 Excel을 안전하게 "
+            f"생성할 수 없습니다. Gmail 재처리 대상 Run ID: {listed}"
+        )
+
+    for row in source_records:
         export_row = _base_export_row(row)
         warnings: list[str] = []
         materials, material_warnings = build_material_columns(row)

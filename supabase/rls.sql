@@ -72,6 +72,8 @@ revoke all on table public.runs from anon, authenticated;
 revoke all on table public.logs from anon, authenticated;
 
 revoke all on function public.save_run_with_logs(jsonb, jsonb) from public, anon;
+revoke all on function public.replace_email_runs_with_logs(bigint, jsonb)
+    from public, anon, authenticated;
 revoke all on function public.dashboard_metrics(
     timestamptz, timestamptz, text, text, text, text, integer
 ) from public, anon;
@@ -89,6 +91,8 @@ grant all on table public.profiles, public.email_messages, public.runs, public.l
 grant usage, select on all sequences in schema public to service_role;
 grant execute on function public.save_run_with_logs(jsonb, jsonb)
     to authenticated, service_role;
+grant execute on function public.replace_email_runs_with_logs(bigint, jsonb)
+    to service_role;
 grant execute on function public.dashboard_metrics(
     timestamptz, timestamptz, text, text, text, text, integer
 ) to authenticated;

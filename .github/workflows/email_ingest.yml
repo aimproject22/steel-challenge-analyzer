@@ -10,6 +10,11 @@ on:
         required: false
         type: boolean
         default: false
+      reprocess_run_ids:
+        description: Existing Run IDs whose source Gmail messages must be reprocessed (comma-separated)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -44,6 +49,15 @@ jobs:
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GMAIL_TARGET_ADDRESS: ${{ secrets.GMAIL_TARGET_ADDRESS }}
-        run: >-
-          python email_ingest.py --max-results 100
-          ${{ inputs.retry_failed && '--retry-failed' || '' }}
+          RETRY_FAILED: ${{ inputs.retry_failed }}
+          REPROCESS_RUN_IDS: ${{ inputs.reprocess_run_ids }}
+        shell: bash
+        run: |
+          args=(--max-results 100)
+          if [[ "$RETRY_FAILED" == "true" ]]; then
+            args+=(--retry-failed)
+          fi
+          if [[ -n "$REPROCESS_RUN_IDS" ]]; then
+            args+=(--reprocess-run-ids "$REPROCESS_RUN_IDS")
+          fi
+          python email_ingest.py "${args[@]}"

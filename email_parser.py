@@ -89,6 +89,75 @@ def parse_event_log(raw_text: Any) -> list[dict]:
     return logs
 
 
+def _renumber_logs(logs: Iterable[Mapping[str, Any]]) -> list[dict]:
+    """Return one run's logs with a clean, consecutive ``log_no`` sequence."""
+
+    result = []
+    for index, log in enumerate(logs, start=1):
+        payload = dict(log)
+        payload["log_no"] = index
+        result.append(normalize_event_log(payload, index))
+    return result
+
+
+def _split_event_logs(logs: list[dict], expected_count: int) -> list[list[dict]]:
+    """Split a combined forwarded-email log into one sequence per result block.
+
+    Steel Challenge result emails end a run with ``Tapping complete``.  Older
+    forwarded messages can also be identified by their event time resetting to
+    zero.  Refusing an ambiguous split is safer than attaching several runs'
+    events to one database record.
+    """
+
+    if expected_count < 1:
+        raise EmailParseError("결과 블록 수가 올바르지 않습니다.")
+    if expected_count == 1:
+        return [_renumber_logs(logs)]
+    if not logs:
+        return [[] for _ in range(expected_count)]
+
+    completed: list[list[dict]] = []
+    current: list[dict] = []
+    for log in logs:
+        current.append(log)
+        if "tapping complete" in normalize_text(log.get("event")).casefold():
+            completed.append(current)
+            current = []
+    if current and completed:
+        completed[-1].extend(current)
+    elif current:
+        completed.append(current)
+    if len(completed) == expected_count:
+        return [_renumber_logs(group) for group in completed]
+
+    reset_groups: list[list[dict]] = []
+    current = []
+    previous_seconds: Optional[float] = None
+    for log in logs:
+        seconds = log.get("event_seconds")
+        if (
+            current
+            and previous_seconds is not None
+            and seconds is not None
+            and float(seconds) < float(previous_seconds)
+        ):
+            reset_groups.append(current)
+            current = []
+        current.append(log)
+        if seconds is not None:
+            previous_seconds = float(seconds)
+    if current:
+        reset_groups.append(current)
+    if len(reset_groups) == expected_count:
+        return [_renumber_logs(group) for group in reset_groups]
+
+    raise EmailParseError(
+        "여러 Run의 Event Log를 안전하게 분리하지 못했습니다: "
+        f"결과 {expected_count}개, Tapping 구간 {len(completed)}개, "
+        f"시간 초기화 구간 {len(reset_groups)}개"
+    )
+
+
 def _merge_section_rows(data: dict, section: str, rows: Iterable[Iterable[Any]]) -> None:
     if section in MEASUREMENT_SECTIONS:
         data.update(parse_current_min_max_rows(rows, section))
@@ -189,6 +258,77 @@ def parse_html_body(
     if not data:
         return parse_plain_body(plain_text, process_type=process_type)
     return _finalize(data, plain_text, process_type)
+
+
+def parse_html_body_many(
+    html_body: str,
+    *,
+    process_type: str = PROCESS_EAF,
+) -> list[tuple[dict, list[dict]]]:
+    """Parse every result block embedded in one HTML email."""
+
+    if not normalize_text(html_body):
+        raise EmailParseError("HTML 본문이 비어 있습니다.")
+
+    soup = BeautifulSoup(html_body, "html.parser")
+    groups: list[list[tuple[str, list[list[str]]]]] = []
+    current_group: Optional[list[tuple[str, list[list[str]]]]] = None
+    current_section: Optional[str] = None
+    seen_tables: set[int] = set()
+
+    for node in soup.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "p", "div", "strong", "b", "table"]
+    ):
+        if node.name == "table":
+            node_id = id(node)
+            if node_id in seen_tables:
+                continue
+            seen_tables.add(node_id)
+            rows = [
+                [
+                    normalize_text(cell.get_text(" ", strip=True))
+                    for cell in row.find_all(["th", "td"])
+                ]
+                for row in node.find_all("tr")
+            ]
+            rows = [row for row in rows if any(row)]
+            section = _classify_table(rows) or current_section
+            if section == SECTION_RUN:
+                if current_group:
+                    groups.append(current_group)
+                current_group = []
+            if current_group is not None and section and section != "Event Log":
+                current_group.append((section, rows))
+            continue
+
+        if node.find_parent("table") is not None:
+            continue
+        text = normalize_text(node.get_text(" ", strip=True))
+        if not text or len(text) > 80:
+            continue
+        section = canonical_section(text)
+        if section:
+            current_section = section
+
+    if current_group:
+        groups.append(current_group)
+    if not groups:
+        plain_text = soup.get_text("\n", strip=True)
+        return parse_plain_body_many(plain_text, process_type=process_type)
+
+    parsed_data: list[dict] = []
+    for group in groups:
+        data: dict = {}
+        for section, rows in group:
+            _merge_section_rows(data, section, rows)
+        data["Run Information > Process Type"] = process_type
+        data.update(build_structured_sections(data))
+        _validate_data(data, process_type)
+        parsed_data.append(data)
+
+    combined_logs = parse_event_log(soup.get_text("\n", strip=True))
+    log_groups = _split_event_logs(combined_logs, len(parsed_data))
+    return list(zip(parsed_data, log_groups))
 
 
 def _clean_plain_lines(plain_body: str) -> list[str]:
@@ -299,13 +439,60 @@ def parse_plain_body(
     return _finalize(data, plain_body, process_type)
 
 
+def parse_plain_body_many(
+    plain_body: str,
+    *,
+    process_type: str = PROCESS_EAF,
+) -> list[tuple[dict, list[dict]]]:
+    """Parse repeated plain-text ``Run Information`` blocks independently."""
+
+    if not normalize_text(plain_body):
+        raise EmailParseError("plain text 본문이 비어 있습니다.")
+    lines = _clean_plain_lines(plain_body)
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if canonical_section(line) == SECTION_RUN
+    ]
+    if len(starts) <= 1:
+        return [parse_plain_body(plain_body, process_type=process_type)]
+
+    parsed: list[tuple[dict, list[dict]]] = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        chunk = "\n".join(lines[start:end])
+        parsed.append(parse_plain_body(chunk, process_type=process_type))
+    return parsed
+
+
 def parse_steel_challenge_email(
     *,
     html_body: Optional[str] = None,
     plain_body: Optional[str] = None,
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> tuple[dict, list[dict], dict]:
-    """Parse HTML first and fall back to plain text, returning canonical data."""
+    """Backward-compatible parser for emails containing exactly one run."""
+
+    parsed = parse_steel_challenge_email_many(
+        html_body=html_body,
+        plain_body=plain_body,
+        metadata=metadata,
+    )
+    if len(parsed) != 1:
+        raise EmailParseError(
+            f"이메일에 Run 결과가 {len(parsed)}개 있습니다. "
+            "parse_steel_challenge_email_many를 사용해야 합니다."
+        )
+    return parsed[0]
+
+
+def parse_steel_challenge_email_many(
+    *,
+    html_body: Optional[str] = None,
+    plain_body: Optional[str] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> list[tuple[dict, list[dict], dict]]:
+    """Parse all Steel Challenge runs in an email, HTML first then plain text."""
 
     errors: list[str] = []
     parsed_metadata = dict(metadata or {})
@@ -318,31 +505,47 @@ def parse_steel_challenge_email(
 
     if html_body:
         try:
-            data, logs = parse_html_body(html_body, process_type=process_type)
-            parsed_metadata.update(
-                {
-                    "parsed_status": "success",
-                    "parser_source": "html",
-                    "parser_error": None,
-                    "raw_excerpt": normalize_text(html_body)[:2000],
-                }
-            )
-            return data, logs, parsed_metadata
+            parsed = parse_html_body_many(html_body, process_type=process_type)
+            count = len(parsed)
+            return [
+                (
+                    data,
+                    logs,
+                    {
+                        **parsed_metadata,
+                        "parsed_status": "success",
+                        "parser_source": "html",
+                        "parser_error": None,
+                        "raw_excerpt": normalize_text(html_body)[:2000],
+                        "source_run_index": index,
+                        "source_run_count": count,
+                    },
+                )
+                for index, (data, logs) in enumerate(parsed, start=1)
+            ]
         except Exception as exc:
             errors.append(f"HTML: {exc}")
 
     if plain_body:
         try:
-            data, logs = parse_plain_body(plain_body, process_type=process_type)
-            parsed_metadata.update(
-                {
-                    "parsed_status": "success",
-                    "parser_source": "plain",
-                    "parser_error": None,
-                    "raw_excerpt": normalize_text(plain_body)[:2000],
-                }
-            )
-            return data, logs, parsed_metadata
+            parsed = parse_plain_body_many(plain_body, process_type=process_type)
+            count = len(parsed)
+            return [
+                (
+                    data,
+                    logs,
+                    {
+                        **parsed_metadata,
+                        "parsed_status": "success",
+                        "parser_source": "plain",
+                        "parser_error": None,
+                        "raw_excerpt": normalize_text(plain_body)[:2000],
+                        "source_run_index": index,
+                        "source_run_count": count,
+                    },
+                )
+                for index, (data, logs) in enumerate(parsed, start=1)
+            ]
         except Exception as exc:
             errors.append(f"plain: {exc}")
 

@@ -729,9 +729,13 @@ def render_download(context: AuthContext) -> None:
     with left:
         if st.button("현재 필터 결과 Excel 생성", use_container_width=True):
             with st.spinner("Excel 생성 중..."):
-                st.session_state["filtered_export"] = _build_download(
-                    context, filters
-                )
+                try:
+                    st.session_state["filtered_export"] = _build_download(
+                        context, filters
+                    )
+                except ValueError as exc:
+                    st.session_state.pop("filtered_export", None)
+                    st.error(str(exc))
         if "filtered_export" in st.session_state:
             data, run_count, log_count, file_name = st.session_state["filtered_export"]
             st.download_button(
@@ -744,7 +748,11 @@ def render_download(context: AuthContext) -> None:
     with right:
         if st.button("전체 데이터 Excel 생성", use_container_width=True):
             with st.spinner("전체 Excel 생성 중..."):
-                st.session_state["full_export"] = _build_download(context, None)
+                try:
+                    st.session_state["full_export"] = _build_download(context, None)
+                except ValueError as exc:
+                    st.session_state.pop("full_export", None)
+                    st.error(str(exc))
         if "full_export" in st.session_state:
             data, run_count, log_count, file_name = st.session_state["full_export"]
             st.download_button(

@@ -245,7 +245,8 @@ Streamlit Community Cloud 기준:
 - 관리자 메뉴도 UI 표시와 별도로 backend에서 `is_admin`을 다시 확인합니다.
 - 앱에 회원가입, 하드코딩 관리자 비밀번호, 운영 DB 전체 삭제 버튼이 없습니다.
 - Excel export는 제어문자를 제거하고 `=`, `+`, `-`, `@`로 시작하는 문자열을 escape합니다.
-- Gmail `gmail_message_id`와 `runs.email_message_id`는 unique하여 중복 Run을 차단합니다.
+- Gmail 메시지는 `gmail_message_id`로 중복 수집을 막고, 한 메시지 안의 여러
+  결과는 `(email_message_id, source_run_index)` 조합으로 각각 저장합니다.
 - Event Log는 `log_no`를 보존하고 `event_seconds`를 별도 저장합니다.
 - Status 0/1의 의미를 임의로 성공/실패로 표시하지 않습니다.
 - ML은 숫자 feature만 사용하고 목표별 직접 누출 feature를 제외하며, 20개 미만이면 학습하지 않습니다.
@@ -276,6 +277,24 @@ Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. �
   적용합니다.
 - 내부 DB/ML의 기존 `feature >` 이름은 유지합니다. Final Steel/Slag와 Raw Log는
   기존 ML 입력에 자동 추가하지 않습니다.
+- 과거 방식으로 여러 결과가 한 DB 행에 합쳐진 경우에는 값을 임의로 버리지 않고
+  Excel 생성을 중단하며 재처리할 Run ID를 오류에 표시합니다.
+
+## 15. Composite Gmail result repair
+
+전달 메일 하나에 여러 Simulation 결과가 누적된 경우에도 각 결과와 Event Log를
+독립된 Run으로 저장합니다. 기존 합성 행을 고치는 순서는 다음과 같습니다.
+
+1. Supabase SQL Editor에서 `supabase/multi_run_email_migration.sql` 전체를 실행합니다.
+2. 변경 사항을 GitHub `main`에 push합니다.
+3. GitHub → Actions → `Steel Challenge Gmail ingestion` → `Run workflow`로 갑니다.
+4. `reprocess_run_ids`에 쉼표로 구분한 기존 합성 Run ID를 입력합니다.
+   현재 확인된 값은 `1005,1006,1034,1035,1036,1037`입니다.
+5. 실행 로그의 `saved_runs`가 6보다 크고 `failed_messages=0`인지 확인합니다.
+
+재처리는 원본 Gmail 메시지를 다시 읽습니다. 각 메시지의 기존 Run과 Event Log를
+새 결과로 바꾸는 작업은 Supabase 함수 한 트랜잭션 안에서 수행되므로, 중간 결과
+저장에 실패하면 삭제도 함께 롤백됩니다.
 
 ## Project files
 
@@ -286,4 +305,5 @@ Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. �
 - `feature_engineering.py`, `ml_engine.py`, `active_learning.py`: 공정 feature와 분석
 - `visualization.py`, `excel_utils.py`, `export_features.py`: Plotly 및 single-sheet `ALL_RUNS` Excel
 - `supabase/schema.sql`, `supabase/rls.sql`: DB migration과 권한
+- `supabase/multi_run_email_migration.sql`: 기존 DB의 다중 Run 이메일 지원 migration
 - `tests/`: parser, DOCX 회귀, feature, ML, Excel 테스트

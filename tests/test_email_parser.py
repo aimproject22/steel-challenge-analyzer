@@ -5,7 +5,11 @@ from datetime import timedelta
 import pytest
 
 from canonical import normalize_datetime
-from email_parser import EmailParseError, parse_steel_challenge_email
+from email_parser import (
+    EmailParseError,
+    parse_steel_challenge_email,
+    parse_steel_challenge_email_many,
+)
 
 
 def test_plain_email_fixture(sample_email_text: str) -> None:
@@ -87,3 +91,55 @@ def test_secondary_steelmaking_does_not_require_eaf_only_sections(
 def test_invalid_email_raises() -> None:
     with pytest.raises(EmailParseError):
         parse_steel_challenge_email(plain_body="not a Steel Challenge result")
+
+
+def test_multiple_html_results_are_split_with_their_event_logs(
+    sample_email_html: str,
+) -> None:
+    second = (
+        sample_email_html
+        .replace("lsh05222@yu.ac.kr", "second@yu.ac.kr")
+        .replace("21/09/2026 22:09:36", "22/09/2026 08:10:11")
+        .replace("$ 419.22", "$ 401.11")
+        .replace("01:05:48", "00:55:00")
+    )
+    combined = sample_email_html.replace("</body></html>", "") + second.replace(
+        "<html><body>", ""
+    )
+
+    parsed = parse_steel_challenge_email_many(html_body=combined)
+
+    assert len(parsed) == 2
+    assert parsed[0][0]["Run Information > User Id"] == "lsh05222@yu.ac.kr"
+    assert parsed[1][0]["Run Information > User Id"] == "second@yu.ac.kr"
+    assert parsed[0][1][-1]["event_seconds"] == pytest.approx(3948)
+    assert parsed[1][1][-1]["event_seconds"] == pytest.approx(3300)
+    assert [log["log_no"] for log in parsed[1][1]] == [1, 2]
+    assert parsed[0][2]["source_run_index"] == 1
+    assert parsed[1][2]["source_run_index"] == 2
+    assert all(item[2]["source_run_count"] == 2 for item in parsed)
+
+
+def test_multiple_plain_results_are_split(sample_email_text: str) -> None:
+    second = (
+        sample_email_text
+        .replace("lsh05222@yu.ac.kr", "plain-second@yu.ac.kr")
+        .replace("21/09/2026 22:09:36", "23/09/2026 09:00:00")
+    )
+
+    parsed = parse_steel_challenge_email_many(
+        plain_body=f"{sample_email_text}\n{second}"
+    )
+
+    assert len(parsed) == 2
+    assert parsed[1][0]["Run Information > User Id"] == "plain-second@yu.ac.kr"
+    assert len(parsed[0][1]) == 14
+    assert len(parsed[1][1]) == 14
+
+
+def test_single_result_api_rejects_composite_email(sample_email_html: str) -> None:
+    combined = sample_email_html.replace("</body></html>", "") + sample_email_html.replace(
+        "<html><body>", ""
+    )
+    with pytest.raises(EmailParseError, match="2개"):
+        parse_steel_challenge_email(html_body=combined)

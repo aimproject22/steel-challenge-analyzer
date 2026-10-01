@@ -4,6 +4,7 @@ from io import BytesIO
 
 import numpy as np
 import pandas as pd
+import pytest
 from openpyxl import load_workbook
 
 from excel_utils import build_all_runs_export_df, make_excel
@@ -189,3 +190,18 @@ def test_duplicate_parser_columns_are_collapsed_deterministically() -> None:
     assert not any(column.startswith("ADD_Lime_2") for column in frame.columns)
     assert frame.loc[0, "QUALITY_warning_count"] == 2
     assert "Conflicting duplicate" in frame.loc[0, "QUALITY_warning_text"]
+
+
+def test_excel_rejects_a_database_row_containing_multiple_runs() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [1035],
+            "Run Information > Date": ["21/09/2026 10:00:00"],
+            "Run Information > Date_2": ["21/09/2026 11:00:00"],
+            "Run Information > Score": [410.0],
+            "Run Information > Score_2": [405.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="1035"):
+        build_all_runs_export_df(runs, pd.DataFrame())
