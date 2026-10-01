@@ -7,6 +7,7 @@ import re
 from typing import Any, Iterable, Mapping, Optional
 
 from canonical import event_time_to_seconds, normalize_event_log
+from export_features import extract_event_export_features
 
 
 def time_to_minutes(time_text: Any) -> Optional[float]:
@@ -313,4 +314,21 @@ def extract_features_from_logs(
         features["feature > oxygen_on_total_duration"] = oxygen_on
 
     features.update(_spec_features(data))
+
+    # Keep the historical ``feature >`` namespace for ML compatibility while
+    # extending it with numeric process features.  The Excel export maps these
+    # values to its own human-readable PWR_/BASKET_/... schema and never adds
+    # raw logs or final composition values to the ML inputs.
+    export_features = extract_event_export_features(
+        events,
+        reported_time_minutes=(data or {}).get(
+            "Cost Breakdown > Time (in minutes)"
+        ),
+        reported_energy_kwh=(data or {}).get("Cost Breakdown > Total Energy"),
+    )
+    for key, value in export_features.items():
+        if key.startswith(("RAW_", "QUALITY_")) or key == "_warnings":
+            continue
+        if isinstance(value, (int, float)) or value is None:
+            features[f"feature > {key.casefold()}"] = value
     return features

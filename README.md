@@ -254,6 +254,29 @@ Streamlit Community Cloud 기준:
 
 Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. 참고: [Supabase Auth](https://supabase.com/docs/guides/auth), [Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security). Gmail 처리 label은 공식 `users.messages.modify` API를 사용합니다: [Gmail messages.modify](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/modify).
 
+## 14. Single-sheet Excel export
+
+앱의 `다운로드` 메뉴에서 현재 필터 또는 전체 데이터의 Excel을 생성할 수 있습니다.
+파일명은 `SteelChallenge_Master_YYYYMMDD_HHMMSS.xlsx`이며 workbook에는
+`ALL_RUNS` 시트 하나만 존재합니다.
+
+- 한 Simulation Run은 정확히 한 행입니다.
+- 열은 `META_`, `PERF_`, `COST_`, `QUALITY_`, `RM_`, `ADD_`, `STEEL_`,
+  `SLAG_`, `BASKET_`, `PWR_`, `O2_`, `CINJ_`, `EVTADD_`, `ANALYSIS_`,
+  `TAP_`, `DERIVED_`, `RAW_` 그룹 순으로 정렬됩니다.
+- Raw Materials, Additions, Steel/Slag Composition은 Run별 wide format으로
+  정리됩니다. 새 material, element, power setpoint는 union schema에 동적으로
+  추가되며 동일 schema의 열 순서는 항상 같습니다.
+- Event Log는 Run ID별로 한 번 group하여 Power 지속시간, Basket 시각/질량,
+  Addition 시각, Analysis 대기시간, Tapping 시각 등의 feature로 변환됩니다.
+- 원본 Event Log와 인식하지 못한 이벤트도 버리지 않습니다. Excel 셀 제한을
+  넘는 로그는 30,000자 단위의 `RAW_event_log_01`, `_02`, ... 열로 손실 없이
+  나눕니다.
+- 세부 그룹은 Excel outline으로 접을 수 있고 header filter와 `G2` freeze pane을
+  적용합니다.
+- 내부 DB/ML의 기존 `feature >` 이름은 유지합니다. Final Steel/Slag와 Raw Log는
+  기존 ML 입력에 자동 추가하지 않습니다.
+
 ## Project files
 
 - `app.py`, `ui_components.py`: 인증 게이트와 화면 라우터
@@ -261,6 +284,6 @@ Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. �
 - `gmail_client.py`, `email_ingest.py`: Gmail API와 예약 worker
 - `db_utils.py`, `auth_utils.py`, `config.py`: DB/Auth/secret 계층
 - `feature_engineering.py`, `ml_engine.py`, `active_learning.py`: 공정 feature와 분석
-- `visualization.py`, `excel_utils.py`: Plotly 및 3-sheet Excel
+- `visualization.py`, `excel_utils.py`, `export_features.py`: Plotly 및 single-sheet `ALL_RUNS` Excel
 - `supabase/schema.sql`, `supabase/rls.sql`: DB migration과 권한
 - `tests/`: parser, DOCX 회귀, feature, ML, Excel 테스트

@@ -704,7 +704,7 @@ def render_manual_upload(context: AuthContext) -> None:
 
 def _build_download(
     context: AuthContext, filters: Optional[Mapping[str, Any]]
-) -> tuple[bytes, int, int]:
+) -> tuple[bytes, int, int, str]:
     if not context.profile.get("public_access"):
         assert_can_download(context.client, str(context.user.id))
     runs = load_all_runs_df(context.client, filters=filters, max_rows=10000)
@@ -713,7 +713,9 @@ def _build_download(
         for value in runs.get("Run ID", pd.Series(dtype="int64")).dropna()
     ]
     logs = load_all_logs_df(context.client, run_ids=run_ids, max_rows=100000)
-    return make_excel(runs, logs).getvalue(), len(runs), len(logs)
+    timestamp = datetime.now(SEOUL).strftime("%Y%m%d_%H%M%S")
+    file_name = f"SteelChallenge_Master_{timestamp}.xlsx"
+    return make_excel(runs, logs).getvalue(), len(runs), len(logs), file_name
 
 
 def render_download(context: AuthContext) -> None:
@@ -731,11 +733,11 @@ def render_download(context: AuthContext) -> None:
                     context, filters
                 )
         if "filtered_export" in st.session_state:
-            data, run_count, log_count = st.session_state["filtered_export"]
+            data, run_count, log_count, file_name = st.session_state["filtered_export"]
             st.download_button(
                 f"현재 필터 다운로드 ({run_count} Runs / {log_count} Logs)",
                 data,
-                "steel_challenge_filtered.xlsx",
+                file_name,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -744,11 +746,11 @@ def render_download(context: AuthContext) -> None:
             with st.spinner("전체 Excel 생성 중..."):
                 st.session_state["full_export"] = _build_download(context, None)
         if "full_export" in st.session_state:
-            data, run_count, log_count = st.session_state["full_export"]
+            data, run_count, log_count, file_name = st.session_state["full_export"]
             st.download_button(
                 f"전체 다운로드 ({run_count} Runs / {log_count} Logs)",
                 data,
-                "steel_challenge_all.xlsx",
+                file_name,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )

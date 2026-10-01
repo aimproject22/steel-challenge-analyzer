@@ -1,22 +1,60 @@
-"""Permission-neutral Excel generation helpers."""
+"""Permission-neutral, single-sheet Excel generation helpers."""
 
 from __future__ import annotations
 
+import math
 import re
 from io import BytesIO
-from typing import Optional
+from typing import Any, Iterable, Mapping, Optional
 
 import pandas as pd
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+from export_features import export_token, extract_event_export_features
 
 
 ILLEGAL_EXCEL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+DUPLICATE_SUFFIX_RE = re.compile(r"_(\d+)$")
+
+CORE_META_COLUMNS = [
+    "META_run_id", "META_run_date", "META_uploaded_at", "META_source",
+    "META_sender", "META_sender_email", "META_steel_user_id",
+    "META_process_type", "META_uploader", "META_file_name", "META_status",
+    "META_score", "META_user_level", "META_steel_grade",
+]
+CORE_PERF_COLUMNS = [
+    "PERF_time_min", "PERF_time_sec", "PERF_tapping_mass_t",
+    "PERF_tap_temperature_c", "PERF_total_energy_kwh",
+    "PERF_energy_kwh_per_t_reported", "PERF_energy_kwh_per_t_calc",
+    "PERF_energy_kwh_per_t_error", "PERF_score",
+]
+CORE_COST_COLUMNS = [
+    "COST_power_raw", "COST_scrap_raw", "COST_additions_raw",
+    "COST_other_consumables_raw", "COST_total_usd", "COST_per_tonne_usd",
+    "COST_scrap_calc_usd", "COST_additions_calc_usd",
+    "COST_electricity_calc_usd", "COST_reconstructed_total_usd",
+    "COST_reconciliation_error_usd", "COST_reconciliation_error_pct",
+]
+CORE_QUALITY_COLUMNS = [
+    "QUALITY_overall_pass", "QUALITY_steel_pass",
+    "QUALITY_steel_violation_count", "QUALITY_slag_pass",
+    "QUALITY_slag_violation_count", "QUALITY_temperature_pass",
+    "QUALITY_time_pass", "QUALITY_mass_pass", "QUALITY_status_consistent",
+    "QUALITY_unknown_event_count", "QUALITY_warning_count",
+    "QUALITY_warning_text",
+]
+GROUP_PREFIXES = (
+    "RM_", "ADD_", "STEEL_", "SLAG_", "BASKET_", "PWR_", "O2_",
+    "CINJ_", "EVTADD_", "ANALYSIS_", "TAP_", "DERIVED_", "RAW_",
+)
 
 
-def remove_illegal_characters(value):
+def remove_illegal_characters(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     cleaned = ILLEGAL_EXCEL_RE.sub("", value)
-    # Prevent spreadsheet formula injection in exported user/email-controlled text.
     if cleaned.startswith(("=", "+", "-", "@")):
         cleaned = "'" + cleaned
     return cleaned
@@ -30,25 +68,439 @@ def clean_dataframe_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def feature_frame(runs_df: pd.DataFrame) -> pd.DataFrame:
+    """Retain the existing ML-facing helper for backward compatibility."""
+
     feature_columns = [
         column for column in runs_df.columns if str(column).startswith("feature >")
     ]
     identity_columns = [
         column
         for column in (
-            "Run ID",
-            "Run Date",
-            "Sender",
-            "Sender Email",
-            "Steel User ID",
-            "Steel Grade",
-            "Score",
-            "Cost Per Tonne",
-            "Time",
+            "Run ID", "Run Date", "Sender", "Sender Email", "Steel User ID",
+            "Steel Grade", "Score", "Cost Per Tonne", "Time",
         )
         if column in runs_df.columns
     ]
     return runs_df[identity_columns + feature_columns].copy()
+
+
+def normalize_export_name(value: Any) -> str:
+    return export_token(value)
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None or value == "":
+        return True
+    if isinstance(value, (dict, list, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _value(row: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        value = row.get(name)
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _number(value: Any) -> Optional[float]:
+    if _is_missing(value):
+        return None
+    try:
+        number = float(str(value).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _run_key(value: Any) -> str:
+    number = _number(value)
+    if number is not None and number.is_integer():
+        return str(int(number))
+    return str(value or "")
+
+
+def aggregate_logs_by_run(logs_df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    """Group logs once so export remains O(runs + logs)."""
+
+    if logs_df is None or logs_df.empty or "run_id" not in logs_df.columns:
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    for run_id, group in logs_df.groupby("run_id", sort=False, dropna=False):
+        result[_run_key(run_id)] = group.to_dict("records")
+    return result
+
+
+def _section_values(
+    row: Mapping[str, Any], section: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Collapse parser duplicate suffixes without trailing Excel columns."""
+
+    prefix = f"{section} > "
+    values: dict[str, Any] = {}
+    warnings: list[str] = []
+    for raw_key, value in row.items():
+        key = str(raw_key)
+        if not key.startswith(prefix) or " > " in key[len(prefix) :]:
+            continue
+        if isinstance(value, (dict, list)) or _is_missing(value):
+            continue
+        raw_name = key[len(prefix) :]
+        name = DUPLICATE_SUFFIX_RE.sub("", raw_name)
+        if name not in values:
+            values[name] = value
+        elif str(values[name]) != str(value):
+            warnings.append(
+                f"Conflicting duplicate {section} value for {name}: "
+                f"kept {values[name]!r}, ignored {value!r}"
+            )
+    return values, warnings
+
+
+def build_material_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    values, warnings = _section_values(row, "Raw Materials")
+    result: dict[str, Any] = {}
+    numeric: list[float] = []
+    nonzero = 0
+    for name, value in values.items():
+        number = _number(value)
+        result[f"RM_{normalize_export_name(name)}_t"] = number if number is not None else value
+        if number is not None:
+            numeric.append(number)
+            nonzero += int(number != 0)
+    result["RM_total_mass_t"] = sum(numeric) if numeric else None
+    result["RM_nonzero_material_count"] = nonzero if values else None
+    return result, warnings
+
+
+def build_addition_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    values, warnings = _section_values(row, "Additions")
+    result: dict[str, Any] = {}
+    numeric: list[float] = []
+    nonzero = 0
+    for name, value in values.items():
+        number = _number(value)
+        result[f"ADD_{normalize_export_name(name)}_kg"] = number if number is not None else value
+        if number is not None:
+            numeric.append(number)
+            nonzero += int(number != 0)
+    result["ADD_total_kg"] = sum(numeric) if numeric else None
+    result["ADD_nonzero_count"] = nonzero if values else None
+    return result, warnings
+
+
+def _composition_source(
+    row: Mapping[str, Any], section: str, nested_key: str
+) -> dict[str, dict[str, Any]]:
+    prefix = f"{section} > "
+    result: dict[str, dict[str, Any]] = {}
+    for raw_key, value in row.items():
+        key = str(raw_key)
+        if not key.startswith(prefix) or isinstance(value, (dict, list)):
+            continue
+        parts = key[len(prefix) :].split(" > ")
+        element = parts[0]
+        field = parts[-1].casefold() if len(parts) > 1 else "current"
+        if field in {"current", "min", "max"} and not _is_missing(value):
+            result.setdefault(element, {})[field] = value
+
+    nested = row.get(nested_key)
+    if isinstance(nested, Mapping):
+        for element, values in nested.items():
+            if not isinstance(values, Mapping):
+                continue
+            target = result.setdefault(str(element), {})
+            for field in ("current", "min", "max"):
+                if field not in target and not _is_missing(values.get(field)):
+                    target[field] = values.get(field)
+    return result
+
+
+def _composition_columns(
+    row: Mapping[str, Any], section: str, prefix: str, nested_key: str
+) -> tuple[dict[str, Any], Optional[int], int]:
+    source = _composition_source(row, section, nested_key)
+    result: dict[str, Any] = {}
+    pass_values: list[int] = []
+    violations = 0
+    for element, values in source.items():
+        token = normalize_export_name(element)
+        current = _number(values.get("current"))
+        minimum = _number(values.get("min"))
+        maximum = _number(values.get("max"))
+        current_suffix = (
+            "Basicity"
+            if prefix == "SLAG_" and token.casefold() == "basicity"
+            else (f"{token}_wt_pct" if prefix == "STEEL_" else f"{token}_pct")
+        )
+        result[f"{prefix}{current_suffix}"] = current
+        result[f"{prefix}{token}_min"] = minimum
+        result[f"{prefix}{token}_max"] = maximum
+        if current is None or (minimum is None and maximum is None):
+            within = None
+        else:
+            within = int(
+                (minimum is None or current >= minimum)
+                and (maximum is None or current <= maximum)
+            )
+            pass_values.append(within)
+            violations += int(not within)
+        result[f"{prefix}{token}_pass"] = within
+        result[f"{prefix}{token}_margin_low"] = (
+            current - minimum if current is not None and minimum is not None else None
+        )
+        result[f"{prefix}{token}_margin_high"] = (
+            maximum - current if current is not None and maximum is not None else None
+        )
+        result[f"{prefix}{token}_normalized_position"] = (
+            (current - minimum) / (maximum - minimum)
+            if current is not None and minimum is not None and maximum is not None
+            and maximum != minimum else None
+        )
+    overall = int(all(pass_values)) if pass_values else None
+    return result, overall, violations
+
+
+def build_steel_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], Optional[int], int]:
+    return _composition_columns(row, "Steel Composition", "STEEL_", "steel_composition")
+
+
+def build_slag_columns(row: Mapping[str, Any]) -> tuple[dict[str, Any], Optional[int], int]:
+    result, overall, violations = _composition_columns(
+        row, "Slag Composition", "SLAG_", "slag_composition"
+    )
+    cao = _number(result.get("SLAG_CaO_pct"))
+    sio2 = _number(result.get("SLAG_SiO2_pct"))
+    reported = _number(result.get("SLAG_Basicity"))
+    calculated = cao / sio2 if cao is not None and sio2 not in (None, 0) else None
+    result["SLAG_Basicity_calc"] = calculated
+    result["SLAG_Basicity_error"] = (
+        reported - calculated if reported is not None and calculated is not None else None
+    )
+    return result, overall, violations
+
+
+def build_event_export_features(
+    logs: Iterable[Mapping[str, Any]], row: Mapping[str, Any]
+) -> dict[str, Any]:
+    return extract_event_export_features(
+        logs,
+        reported_time_minutes=_value(row, "Time", "Cost Breakdown > Time (in minutes)"),
+        reported_energy_kwh=_value(row, "Total Energy kWh", "Cost Breakdown > Total Energy"),
+    )
+
+
+def _base_export_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    process_time = _number(_value(row, "Time", "Cost Breakdown > Time (in minutes)"))
+    tapping_mass = _number(_value(row, "Tapping Mass", "Cost Breakdown > Tapping mass"))
+    total_energy = _number(_value(row, "Total Energy kWh", "Cost Breakdown > Total Energy"))
+    reported_energy_per_t = _number(
+        _value(row, "Energy kWh/t", "Cost Breakdown > Total Energy_2")
+    )
+    calculated_energy_per_t = (
+        total_energy / tapping_mass
+        if total_energy is not None and tapping_mass not in (None, 0) else None
+    )
+    total_cost = _number(_value(row, "Total Cost", "Cost Breakdown > Total Cost"))
+    cost_per_tonne = _number(_value(row, "Cost Per Tonne", "Cost Breakdown > Cost Per Tonne"))
+    result = {
+        "META_run_id": _value(row, "Run ID", "id"),
+        "META_run_date": _value(row, "Run Date", "Run Information > Date"),
+        "META_uploaded_at": _value(row, "Uploaded At", "uploaded_at", "created_at"),
+        "META_source": _value(row, "Source", "source"),
+        "META_sender": _value(row, "Sender", "sender_name"),
+        "META_sender_email": _value(row, "Sender Email", "sender_email"),
+        "META_steel_user_id": _value(row, "Steel User ID", "Run Information > User Id"),
+        "META_process_type": _value(row, "Process Type", "Run Information > Process Type"),
+        "META_uploader": _value(row, "Uploader", "uploader"),
+        "META_file_name": _value(row, "File Name", "file_name"),
+        "META_status": _number(_value(row, "Status", "Run Information > Status")),
+        "META_score": _number(_value(row, "Score", "Run Information > Score")),
+        "META_user_level": _value(row, "User Level", "Simulation Settings > User Level"),
+        "META_steel_grade": _value(row, "Steel Grade", "Simulation Settings > Steel Grade"),
+        "PERF_time_min": process_time,
+        "PERF_time_sec": process_time * 60.0 if process_time is not None else None,
+        "PERF_tapping_mass_t": tapping_mass,
+        "PERF_tap_temperature_c": _number(_value(row, "Tap Temperature", "Cost Breakdown > Tap temperature")),
+        "PERF_total_energy_kwh": total_energy,
+        "PERF_energy_kwh_per_t_reported": reported_energy_per_t,
+        "PERF_energy_kwh_per_t_calc": calculated_energy_per_t,
+        "PERF_energy_kwh_per_t_error": (
+            reported_energy_per_t - calculated_energy_per_t
+            if reported_energy_per_t is not None and calculated_energy_per_t is not None else None
+        ),
+        "PERF_score": _number(_value(row, "Score", "Run Information > Score")),
+        "COST_power_raw": _number(_value(row, "Cost Breakdown > Power")),
+        "COST_scrap_raw": _number(_value(row, "Cost Breakdown > Scrap")),
+        "COST_additions_raw": _number(_value(row, "Cost Breakdown > Additions")),
+        "COST_other_consumables_raw": _number(_value(row, "Cost Breakdown > Other consumables")),
+        "COST_total_usd": total_cost,
+        "COST_per_tonne_usd": cost_per_tonne,
+        "COST_scrap_calc_usd": None,
+        "COST_additions_calc_usd": None,
+        "COST_electricity_calc_usd": None,
+        "COST_reconstructed_total_usd": None,
+        "COST_reconciliation_error_usd": None,
+        "COST_reconciliation_error_pct": None,
+    }
+    result["DERIVED_energy_per_process_min"] = (
+        total_energy / process_time if total_energy is not None and process_time not in (None, 0) else None
+    )
+    result["DERIVED_cost_per_process_min"] = (
+        total_cost / process_time if total_cost is not None and process_time not in (None, 0) else None
+    )
+    result["DERIVED_cost_per_tapping_t"] = (
+        total_cost / tapping_mass if total_cost is not None and tapping_mass not in (None, 0) else None
+    )
+    return result
+
+
+def _column_order(columns: Iterable[str]) -> list[str]:
+    available = set(columns)
+    ordered: list[str] = []
+
+    def natural_key(value: str) -> list[tuple[int, Any]]:
+        return [
+            (0, int(part)) if part.isdigit() else (1, part.casefold())
+            for part in re.split(r"(\d+)", value)
+            if part
+        ]
+
+    for column in CORE_META_COLUMNS + CORE_PERF_COLUMNS + CORE_COST_COLUMNS + CORE_QUALITY_COLUMNS:
+        if column in available:
+            ordered.append(column)
+    for prefix in GROUP_PREFIXES:
+        group = [column for column in available if column.startswith(prefix)]
+        if prefix == "RAW_":
+            preferred = ["RAW_event_sequence", "RAW_unknown_events"]
+            ordered.extend(column for column in preferred if column in group)
+            group = [column for column in group if column not in preferred]
+        ordered.extend(sorted(group, key=natural_key))
+    ordered.extend(sorted(available - set(ordered), key=lambda value: value.casefold()))
+    return ordered
+
+
+def build_all_runs_export_df(
+    runs_df: pd.DataFrame,
+    logs_df: pd.DataFrame,
+    ml_features_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Return the deterministic 1-run-per-row ALL_RUNS export frame."""
+
+    del ml_features_df
+    log_groups = aggregate_logs_by_run(logs_df)
+    records: list[dict[str, Any]] = []
+    source_runs = runs_df if runs_df is not None else pd.DataFrame()
+    for row in source_runs.to_dict("records"):
+        export_row = _base_export_row(row)
+        warnings: list[str] = []
+        materials, material_warnings = build_material_columns(row)
+        additions, addition_warnings = build_addition_columns(row)
+        steel, steel_pass, steel_violations = build_steel_columns(row)
+        slag, slag_pass, slag_violations = build_slag_columns(row)
+        warnings.extend(material_warnings)
+        warnings.extend(addition_warnings)
+        export_row.update(materials)
+        export_row.update(additions)
+        export_row.update(steel)
+        export_row.update(slag)
+
+        run_logs = log_groups.get(_run_key(export_row.get("META_run_id")), [])
+        event_features = build_event_export_features(run_logs, row)
+        warnings.extend(event_features.pop("_warnings", []))
+        export_row.update(event_features)
+        export_row.update({
+            "QUALITY_steel_pass": steel_pass,
+            "QUALITY_steel_violation_count": steel_violations,
+            "QUALITY_slag_pass": slag_pass,
+            "QUALITY_slag_violation_count": slag_violations,
+            "QUALITY_temperature_pass": None,
+            "QUALITY_time_pass": None,
+            "QUALITY_mass_pass": None,
+        })
+        known_quality = [value for value in (steel_pass, slag_pass) if value is not None]
+        overall = int(all(known_quality)) if known_quality else None
+        export_row["QUALITY_overall_pass"] = overall
+        status = _number(export_row.get("META_status"))
+        export_row["QUALITY_status_consistent"] = (
+            int(status == overall) if status is not None and overall is not None else None
+        )
+        if not run_logs:
+            warnings.append("Event Log missing")
+        export_row["QUALITY_warning_count"] = len(warnings)
+        export_row["QUALITY_warning_text"] = " | ".join(warnings)
+        records.append(export_row)
+
+    frame = pd.DataFrame(records)
+    if frame.empty:
+        frame = pd.DataFrame(
+            columns=CORE_META_COLUMNS + CORE_PERF_COLUMNS + CORE_COST_COLUMNS + CORE_QUALITY_COLUMNS
+        )
+    return frame.reindex(columns=_column_order(frame.columns))
+
+
+def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
+    worksheet = writer.book["ALL_RUNS"]
+    worksheet.freeze_panes = "G2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+    worksheet.sheet_view.showGridLines = False
+    worksheet.sheet_properties.outlinePr.summaryRight = True
+    group_colors = {
+        "META_": "1F4E78", "PERF_": "0F6B5D", "COST_": "8A5A00",
+        "QUALITY_": "7F1D1D", "RM_": "355E3B", "ADD_": "526D82",
+        "STEEL_": "4C566A", "SLAG_": "5B4B8A", "BASKET_": "6B5B3E",
+        "PWR_": "9A3412", "O2_": "0369A1", "CINJ_": "374151",
+        "EVTADD_": "7C3AED", "ANALYSIS_": "0F766E", "TAP_": "B45309",
+        "DERIVED_": "475569", "RAW_": "334155",
+    }
+    for cell in worksheet[1]:
+        prefix = next((item for item in group_colors if str(cell.value).startswith(item)), "META_")
+        cell.fill = PatternFill("solid", fgColor=group_colors[prefix])
+        cell.font = Font(color="FFFFFF", bold=True, name="Arial", size=10)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    worksheet.row_dimensions[1].height = 36
+
+    sample_rows = min(len(frame), 200)
+    for index, column in enumerate(frame.columns, start=1):
+        letter = get_column_letter(index)
+        lengths = [len(str(column))]
+        if sample_rows:
+            lengths.extend(
+                len(str(value)) for value in frame[column].head(sample_rows)
+                if not _is_missing(value)
+            )
+        width = 48 if column.startswith("RAW_") or column == "QUALITY_warning_text" else min(max(max(lengths, default=8) + 2, 11), 24)
+        worksheet.column_dimensions[letter].width = width
+        if column.startswith("RAW_") or column == "QUALITY_warning_text":
+            for cell in worksheet[letter][1:]:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    for prefix in GROUP_PREFIXES:
+        indexes = [
+            index for index, column in enumerate(frame.columns, start=1)
+            if column.startswith(prefix)
+        ]
+        if indexes:
+            for index in range(min(indexes), max(indexes) + 1):
+                worksheet.column_dimensions[get_column_letter(index)].outlineLevel = 1
+                worksheet.column_dimensions[get_column_letter(index)].hidden = False
+
+    green = PatternFill("solid", fgColor="DCFCE7")
+    red = PatternFill("solid", fgColor="FEE2E2")
+    for index, column in enumerate(frame.columns, start=1):
+        if column.startswith("QUALITY_") and column.endswith(("_pass", "_consistent")):
+            letter = get_column_letter(index)
+            target = f"{letter}2:{letter}{max(2, len(frame) + 1)}"
+            worksheet.conditional_formatting.add(
+                target, CellIsRule(operator="equal", formula=["1"], fill=green)
+            )
+            worksheet.conditional_formatting.add(
+                target, CellIsRule(operator="equal", formula=["0"], fill=red)
+            )
 
 
 def make_excel(
@@ -56,18 +508,10 @@ def make_excel(
     logs_df: pd.DataFrame,
     ml_features_df: Optional[pd.DataFrame] = None,
 ) -> BytesIO:
-    features = feature_frame(runs_df) if ml_features_df is None else ml_features_df
+    all_runs = build_all_runs_export_df(runs_df, logs_df, ml_features_df)
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        clean_dataframe_for_excel(runs_df).to_excel(
-            writer, sheet_name="Runs", index=False
-        )
-        clean_dataframe_for_excel(logs_df).to_excel(
-            writer, sheet_name="Event Logs", index=False
-        )
-        clean_dataframe_for_excel(features).to_excel(
-            writer, sheet_name="ML Features", index=False
-        )
+        clean_dataframe_for_excel(all_runs).to_excel(writer, sheet_name="ALL_RUNS", index=False)
+        apply_excel_formatting(writer, all_runs)
     output.seek(0)
     return output
-
