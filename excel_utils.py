@@ -471,6 +471,7 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
     worksheet.freeze_panes = "G2"
     worksheet.auto_filter.ref = worksheet.dimensions
     worksheet.sheet_view.showGridLines = False
+    worksheet.sheet_view.zoomScale = 85
     worksheet.sheet_properties.outlinePr.summaryRight = True
     group_colors = {
         "META_": "1F4E78", "PERF_": "0F6B5D", "COST_": "8A5A00",
@@ -486,6 +487,12 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
         cell.font = Font(color="FFFFFF", bold=True, name="Arial", size=10)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     worksheet.row_dimensions[1].height = 36
+    # Raw event cells can contain thousands of characters.  When wrap_text is
+    # enabled Excel auto-expands the whole Run row to several screen heights.
+    # Keep every Run compact; the full cell value remains available in the
+    # formula bar and is not truncated in the workbook.
+    for row_index in range(2, len(frame) + 2):
+        worksheet.row_dimensions[row_index].height = 20
 
     sample_rows = min(len(frame), 200)
     for index, column in enumerate(frame.columns, start=1):
@@ -500,7 +507,7 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
         worksheet.column_dimensions[letter].width = width
         if column.startswith("RAW_") or column == "QUALITY_warning_text":
             for cell in worksheet[letter][1:]:
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.alignment = Alignment(vertical="center", wrap_text=False)
 
     for prefix in GROUP_PREFIXES:
         indexes = [

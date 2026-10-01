@@ -68,6 +68,8 @@ def test_excel_has_single_all_runs_sheet_and_sanitizes_strings() -> None:
     assert worksheet.max_row == 2
     assert worksheet.cell(2, headers["META_sender"]).value.startswith("'")
     assert "\x00" not in worksheet.cell(2, headers["RAW_event_log_01"]).value
+    assert worksheet.row_dimensions[2].height == 20
+    assert not worksheet.cell(2, headers["RAW_event_log_01"]).alignment.wrap_text
 
 
 def test_excel_two_runs_produce_two_rows_and_aggregate_logs() -> None:
