@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
+import excel_utils
 from excel_utils import (
     apply_other_consumables_decomposition,
     build_analysis_dataframe,
@@ -605,6 +606,24 @@ def test_public_results_contains_reported_values_only() -> None:
     assert not any("Corrected" in column or "Reconstructed" in column for column in results)
 
 
+def test_results_headers_are_unique_and_steel_grade_appears_once() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [1],
+            "Steel Grade": ["Construction Steel"],
+            "Steel Composition > C > Current": [0.115],
+        }
+    )
+    results = build_results_dataframe(runs, pd.DataFrame())
+    assert len(results.columns) == len(set(results.columns))
+    assert results.columns.tolist().count("Steel_Grade") == 1
+
+    workbook = load_workbook(BytesIO(make_excel(runs, pd.DataFrame()).getvalue()))
+    headers = [cell.value for cell in workbook["RESULTS"][1] if cell.value is not None]
+    assert len(headers) == len(set(headers))
+    assert headers.count("Steel_Grade") == 1
+
+
 def test_two_sheets_keep_identical_run_order_and_one_row_per_run() -> None:
     runs = pd.DataFrame({"Run ID": [1003, 1001, 1002], "Status": [1, 0, 1]})
     results, analysis = build_excel_frames(runs, pd.DataFrame())
@@ -668,6 +687,51 @@ def test_analysis_run_1021_cost_and_electrode_regression() -> None:
     assert analysis["Corrected_Power_Cost_USD"] == pytest.approx(18968.24)
     assert analysis["Other_Consumables_USD"] == pytest.approx(298.26)
     assert analysis["Electrode_Break_Count"] == 1
+    assert analysis["Electrode_Replacement_Count"] == 1
+    assert analysis["Electrode_Total_Downtime_sec"] == 688
+
+
+def test_analysis_run_1021_other_cost_conservation(monkeypatch) -> None:
+    wide = pd.DataFrame(
+        [
+            {
+                "META_run_id": 1021,
+                "COST_mapping_applied": 1,
+                "COST_additions_usd": 354.5,
+                "COST_scrap_usd": 16150,
+                "COST_power_usd": 18968.24,
+                "COST_total_usd": 35771,
+                "COST_source_power_raw": 354.5,
+                "COST_source_additions_raw": 16150,
+                "COST_source_other_consumables_raw": 18968.24,
+                "COST_other_model_confidence": "MEDIUM",
+                "COST_oxygen_estimated_usd": 68.39054940738042,
+                "COST_carbon_injection_estimated_usd": 0,
+                "COST_tapping_estimated_usd": 51.89266186582245,
+                # Deliberately simulate the old, unsafe model allocation.
+                "COST_other_unexplained_usd": 0,
+                "COST_electrode_breakage_model_confidence": "MEDIUM",
+                "COST_electrode_breakage_estimated_usd": 177.97678872679555,
+                "ELEC_break_count": 1,
+                "ELEC_replacement_count": 1,
+                "ELEC_total_downtime_sec": 688,
+            }
+        ]
+    )
+    monkeypatch.setattr(excel_utils, "build_all_runs_export_df", lambda *args: wide)
+    analysis = build_analysis_dataframe(pd.DataFrame(), pd.DataFrame()).iloc[0]
+    assert analysis["Corrected_Additions_Cost_USD"] == pytest.approx(354.5)
+    assert analysis["Corrected_Scrap_Cost_USD"] == pytest.approx(16150)
+    assert analysis["Corrected_Power_Cost_USD"] == pytest.approx(18968.24)
+    assert analysis["Other_Consumables_USD"] == pytest.approx(298.26)
+    assert analysis["Oxygen_Cost_Estimated_USD"] == pytest.approx(68.39054940738042)
+    assert analysis["Carbon_Cost_Estimated_USD"] == 0
+    assert analysis["Tapping_Cost_Estimated_USD"] == pytest.approx(51.89266186582245)
+    assert analysis["Other_Unexplained_USD"] == pytest.approx(177.97678872679555)
+    assert analysis["Other_Cost_Reconciliation_Error_USD"] == pytest.approx(0)
+    assert "Electrode_Breakage_Cost_Estimated_USD" not in analysis.index
+    assert analysis["Electrode_Break_Count"] == 1
+    assert analysis["Electrode_Replacement_Count"] == 1
     assert analysis["Electrode_Total_Downtime_sec"] == 688
 
 
@@ -688,6 +752,32 @@ def test_small_cost_residual_is_explicit_rounding_adjustment() -> None:
     assert row["Other_Consumables_Raw_Residual"] == pytest.approx(-0.31)
     assert row["Other_Consumables_USD"] == 0
     assert row["Cost_Rounding_Adjustment_USD"] == pytest.approx(-0.31)
+
+
+def test_other_cost_component_rounding_preserves_conservation(monkeypatch) -> None:
+    wide = pd.DataFrame(
+        [
+            {
+                "META_run_id": 1,
+                "COST_mapping_applied": 0,
+                "COST_additions_usd": 0,
+                "COST_scrap_usd": 0,
+                "COST_power_usd": 0,
+                "COST_total_usd": 100,
+                "COST_other_consumables_reconstructed_usd": 100,
+                "COST_other_model_confidence": "MEDIUM",
+                "COST_oxygen_estimated_usd": 50.1,
+                "COST_carbon_injection_estimated_usd": 0,
+                "COST_tapping_estimated_usd": 50.21,
+            }
+        ]
+    )
+    monkeypatch.setattr(excel_utils, "build_all_runs_export_df", lambda *args: wide)
+    row = build_analysis_dataframe(pd.DataFrame(), pd.DataFrame()).iloc[0]
+    assert row["Other_Unexplained_USD"] == 0
+    assert row["Cost_Rounding_Adjustment_USD"] == pytest.approx(-0.31)
+    assert row["Other_Cost_Reconciliation_Error_USD"] == pytest.approx(-0.31)
+    assert abs(row["Other_Cost_Reconciliation_Error_USD"]) <= 0.5
 
 
 def test_public_raw_event_chunks_preserve_all_text() -> None:

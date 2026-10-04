@@ -1123,7 +1123,11 @@ def build_results_dataframe(
     for prefix in groups:
         ordered.extend(
             sorted(
-                (column for column in frame if column.startswith(prefix)),
+                (
+                    column
+                    for column in frame
+                    if column.startswith(prefix) and column not in ordered
+                ),
                 key=_natural_column_key,
             )
         )
@@ -1242,6 +1246,58 @@ def _analysis_cost_fields(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _analysis_other_cost_fields(
+    record: dict[str, Any], source: Mapping[str, Any]
+) -> None:
+    """Export a conservative, auditable Other Consumables decomposition.
+
+    Electrode events establish that an incident occurred, but they do not
+    establish a monetary replacement cost.  Until a verified electrode price
+    source is available, any remaining cost stays explicitly unexplained.
+    """
+
+    other_total = _number(record.get("Other_Consumables_USD"))
+    model_confidence = str(source.get("COST_other_model_confidence") or "")
+    component_fields = (
+        ("COST_oxygen_estimated_usd", "Oxygen_Cost_Estimated_USD"),
+        ("COST_carbon_injection_estimated_usd", "Carbon_Cost_Estimated_USD"),
+        ("COST_tapping_estimated_usd", "Tapping_Cost_Estimated_USD"),
+    )
+
+    known_components: list[float] = []
+    if model_confidence in {"MEDIUM", "HIGH"}:
+        for source_name, export_name in component_fields:
+            value = _number(source.get(source_name))
+            if value is not None:
+                record[export_name] = value
+                known_components.append(value)
+        record["Other_Cost_Model_Confidence"] = model_confidence
+
+    if other_total is None:
+        return
+
+    raw_unexplained = other_total - sum(known_components)
+    component_rounding_adjustment = (
+        raw_unexplained if abs(raw_unexplained) <= 0.5 else 0.0
+    )
+    unexplained = 0.0 if component_rounding_adjustment else raw_unexplained
+
+    # Reuse the existing rounding column when it is not already carrying a
+    # top-level cost-mapping adjustment.
+    existing_rounding = _number(record.get("Cost_Rounding_Adjustment_USD"))
+    if component_rounding_adjustment and (
+        existing_rounding is None or abs(existing_rounding) < 1e-12
+    ):
+        record["Cost_Rounding_Adjustment_USD"] = component_rounding_adjustment
+
+    record["Other_Unexplained_USD"] = unexplained
+    record["Other_Cost_Reconciliation_Error_USD"] = (
+        other_total
+        - sum(known_components)
+        - unexplained
+    )
+
+
 def build_analysis_dataframe(
     runs_df: pd.DataFrame,
     logs_df: pd.DataFrame,
@@ -1281,24 +1337,7 @@ def build_analysis_dataframe(
             if gap and int(gap.group(1)) <= 2:
                 record[f"Basket{gap.group(1)}_to_{gap.group(2)}_Gap_sec"] = value
 
-        model_confidence = str(source.get("COST_other_model_confidence") or "")
-        if model_confidence in {"MEDIUM", "HIGH"}:
-            record.update(
-                {
-                    "Oxygen_Cost_Estimated_USD": source.get("COST_oxygen_estimated_usd"),
-                    "Carbon_Cost_Estimated_USD": source.get("COST_carbon_injection_estimated_usd"),
-                    "Tapping_Cost_Estimated_USD": source.get("COST_tapping_estimated_usd"),
-                    "Other_Unexplained_USD": source.get("COST_other_unexplained_usd"),
-                    "Other_Cost_Model_Confidence": model_confidence,
-                }
-            )
-        electrode_confidence = str(
-            source.get("COST_electrode_breakage_model_confidence") or ""
-        )
-        if electrode_confidence in {"MEDIUM", "HIGH"}:
-            record["Electrode_Breakage_Cost_Estimated_USD"] = source.get(
-                "COST_electrode_breakage_estimated_usd"
-            )
+        _analysis_other_cost_fields(record, source)
         records.append(record)
 
     frame = pd.DataFrame(records)
@@ -1308,6 +1347,7 @@ def build_analysis_dataframe(
     preferred = ["Run_ID"] + list(ANALYSIS_FIELD_MAP.values()) + [
         "Other_Consumables_Raw_Residual", "Other_Consumables_USD",
         "Cost_Rounding_Adjustment_USD", "Cost_Reconciliation_Error_USD",
+        "Other_Cost_Reconciliation_Error_USD",
     ]
     ordered = [column for column in preferred if column in frame]
     remaining = sorted(
