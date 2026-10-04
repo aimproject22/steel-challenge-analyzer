@@ -27,6 +27,7 @@ def test_plain_email_fixture(sample_email_text: str) -> None:
     assert data["Additions > Iron Oxide"] == 250
     assert data["Additions > Dolomite"] == 450
     assert data["Additions > Lime"] == 700
+    assert data["Parser Diagnostics > Additions Parse Status"] == "REPORT_PARSED"
     assert data["Steel Composition > C > Current"] == pytest.approx(0.076)
     assert data["Steel Composition > C > Min"] == pytest.approx(0.1)
     assert len(logs) == 14
@@ -43,6 +44,7 @@ def test_html_email_tables(sample_email_html: str) -> None:
     assert data["Cost Breakdown > Total Energy"] == 36069
     assert data["Cost Breakdown > Total Energy_2"] == 411
     assert data["Additions > Iron Oxide"] == 250
+    assert data["Parser Diagnostics > Additions Parse Status"] == "REPORT_PARSED"
     assert data["Slag Composition > Basicity > Max"] == pytest.approx(2.5)
     assert logs[-1]["event_seconds"] == pytest.approx(3948)
     assert metadata["parser_source"] == "html"
@@ -83,6 +85,7 @@ def test_secondary_steelmaking_does_not_require_eaf_only_sections(
     assert data["Run Information > Process Type"] == "Secondary Steelmaking"
     assert data["Cost Breakdown > Cost Per Tonne"] == pytest.approx(419.22)
     assert not any(key.startswith("Additions > ") for key in data)
+    assert data["Parser Diagnostics > Additions Parse Status"] == "REPORT_SECTION_MISSING"
     assert not any(key.startswith("Slag Composition > ") for key in data)
     assert logs[-1]["event"] == "Tapping complete"
     assert metadata["process_type"] == "Secondary Steelmaking"

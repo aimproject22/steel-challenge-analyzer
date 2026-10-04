@@ -7,7 +7,11 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
-from excel_utils import build_all_runs_export_df, make_excel
+from excel_utils import (
+    apply_other_consumables_decomposition,
+    build_all_runs_export_df,
+    make_excel,
+)
 from export_features import extract_event_export_features
 from ml_engine import get_safe_feature_columns, train_model
 
@@ -234,7 +238,7 @@ def test_all_null_and_spec_less_columns_are_not_exported() -> None:
     frame = build_all_runs_export_df(runs, pd.DataFrame())
     assert "SLAG_Al2O3_pct" in frame
     assert "SLAG_Al2O3_min" not in frame
-    assert "COST_power_corrected_usd" not in frame
+    assert "COST_power_usd" not in frame
     assert not any(frame[column].isna().all() for column in frame)
 
 
@@ -283,6 +287,7 @@ def test_cost_mapping_detects_shift_without_price_hardcoding() -> None:
     runs = pd.DataFrame(
         {
             "Run ID": [1],
+            "Process Type": ["Electric Arc Furnace"],
             "Time": [42],
             "Cost Breakdown > Power": [591.2],
             "Cost Breakdown > Scrap": [42],
@@ -292,12 +297,142 @@ def test_cost_mapping_detects_shift_without_price_hardcoding() -> None:
         }
     )
     row = build_all_runs_export_df(runs, pd.DataFrame()).iloc[0]
-    assert row["COST_label_mismatch_detected"] == 1
-    assert row["COST_power_corrected_usd"] == pytest.approx(19300.85)
-    assert row["COST_scrap_corrected_usd"] == pytest.approx(16020)
-    assert row["COST_additions_corrected_usd"] == pytest.approx(591.2)
-    assert row["COST_other_corrected_usd"] == pytest.approx(0)
+    assert row["COST_mapping_applied"] == 1
+    assert row["COST_mapping_type"] == "STEELUNIVERSITY_EAF_KNOWN_SHIFT"
+    assert row["COST_source_scrap_is_time_duplicate"] == 1
+    assert row["COST_power_usd"] == pytest.approx(19300.85)
+    assert row["COST_scrap_usd"] == pytest.approx(16020)
+    assert row["COST_additions_usd"] == pytest.approx(591.2)
+    assert row["COST_other_consumables_reconstructed_usd"] == pytest.approx(0)
     assert row["COST_reconciliation_error_usd"] == pytest.approx(0.05)
+
+
+def test_run_1021_cost_mapping_and_electrode_downtime() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [1021],
+            "Process Type": ["Electric Arc Furnace"],
+            "Time": [70],
+            "Cost Breakdown > Power": [354.5],
+            "Cost Breakdown > Scrap": [70],
+            "Cost Breakdown > Additions": [16150],
+            "Cost Breakdown > Other consumables": [18968.24],
+            "Total Cost": [35771],
+        }
+    )
+    event_rows = [
+        ("00:34:54", "Electrode breakage"),
+        ("00:46:22", "Broken electrode has been replaced"),
+        ("00:56:23", "Oxygen flow changed (10 Nm³ / min)"),
+        ("00:56:25", "Oxygen flow changed (20 Nm³ / min)"),
+        ("00:56:27", "Oxygen flow changed (30 Nm³ / min)"),
+        ("00:56:29", "Oxygen flow changed (40 Nm³ / min)"),
+        ("00:56:31", "Oxygen flow changed (50 Nm³ / min)"),
+        ("00:56:33", "Oxygen flow changed (60 Nm³ / min)"),
+        ("00:56:35", "Oxygen flow changed (70 Nm³ / min)"),
+        ("00:56:37", "Oxygen flow changed (80 Nm³ / min)"),
+        ("00:56:39", "Oxygen flow changed (90 Nm³ / min)"),
+        ("00:56:45", "Oxygen flow changed (100 Nm³ / min)"),
+        ("00:56:49", "Oxygen flow changed (110 Nm³ / min)"),
+        ("00:56:55", "Oxygen flow changed (120 Nm³ / min)"),
+        ("00:57:00", "Oxygen flow changed (130 Nm³ / min)"),
+        ("01:02:09", "Oxygen flow changed (120 Nm³ / min)"),
+        ("01:02:11", "Oxygen flow changed (110 Nm³ / min)"),
+        ("01:02:13", "Oxygen flow changed (100 Nm³ / min)"),
+        ("01:02:18", "Oxygen flow changed (90 Nm³ / min)"),
+        ("01:06:37", "Oxygen flow changed (0 Nm³ / min)"),
+        ("01:08:31", "Tapping start"),
+        ("01:10:20", "Tapping complete"),
+    ]
+    logs = pd.DataFrame(
+        [
+            {"run_id": 1021, "log_no": index, "time": time, "event": event}
+            for index, (time, event) in enumerate(event_rows, start=1)
+        ]
+    )
+    row = build_all_runs_export_df(runs, logs).iloc[0]
+    assert row["COST_other_consumables_reconstructed_usd"] == pytest.approx(298.26)
+    assert row["ELEC_break_count"] == 1
+    assert row["ELEC_first_break_sec"] == 2094
+    assert row["ELEC_first_replacement_sec"] == 2782
+    assert row["ELEC_total_downtime_sec"] == 688
+    assert row["O2_integrated_Nm3"] == pytest.approx(1122.6666666667)
+    assert row["CINJ_integrated_kg"] == 0
+    assert row["TAP_duration_sec"] == 109
+
+
+def test_other_consumables_model_uses_data_not_hardcoded_prices() -> None:
+    rows = []
+    for index in range(20):
+        oxygen = 100 + index * 20
+        carbon = float((index % 4) * 5)
+        rows.append(
+            {
+                "META_process_type": "Electric Arc Furnace",
+                "COST_other_total_usd": 50 + 0.1 * oxygen + 2.0 * carbon,
+                "O2_integrated_Nm3": oxygen,
+                "O2_used": 1,
+                "CINJ_integrated_kg": carbon,
+                "CINJ_used": int(carbon > 0),
+                "ELEC_break_count": 0,
+            }
+        )
+    rows.append(
+        {
+            "META_process_type": "Electric Arc Furnace",
+            "COST_other_total_usd": 50 + 0.1 * 600 + 2.0 * 10 + 300,
+            "O2_integrated_Nm3": 600,
+            "O2_used": 1,
+            "CINJ_integrated_kg": 10,
+            "CINJ_used": 1,
+            "ELEC_break_count": 1,
+        }
+    )
+    result = apply_other_consumables_decomposition(pd.DataFrame(rows))
+    break_row = result.iloc[-1]
+    assert break_row["COST_other_model_name"] == "BASE_O2_C"
+    assert break_row["COST_tapping_estimated_usd"] == pytest.approx(50)
+    assert break_row["COST_oxygen_estimated_usd"] == pytest.approx(60)
+    assert break_row["COST_carbon_injection_estimated_usd"] == pytest.approx(20)
+    assert break_row["COST_electrode_breakage_estimated_usd"] == pytest.approx(300)
+    assert break_row["COST_other_unexplained_usd"] == pytest.approx(0)
+
+
+def test_multiple_electrode_events_use_fifo_pairing() -> None:
+    result = extract_event_export_features(
+        [
+            {"time": "00:01:00", "event": "Electrode broke"},
+            {"time": "00:02:00", "event": "Electrode breakage"},
+            {"time": "00:04:00", "event": "Broken electrode has been replaced"},
+            {"time": "00:07:00", "event": "New electrode installed"},
+            {"time": "00:08:00", "event": "Tapping complete"},
+        ]
+    )
+    assert result["ELEC_break_count"] == 2
+    assert result["ELEC_replacement_count"] == 2
+    assert result["ELEC_total_downtime_sec"] == 480
+    assert result["ELEC_unpaired_break_count"] == 0
+    assert result["ELEC_unpaired_replacement_count"] == 0
+
+
+def test_non_eaf_costs_are_not_shifted() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [2],
+            "Process Type": ["Secondary Steelmaking"],
+            "Cost Breakdown > Power": [10],
+            "Cost Breakdown > Scrap": [20],
+            "Cost Breakdown > Additions": [30],
+            "Cost Breakdown > Other consumables": [40],
+            "Total Cost": [100],
+        }
+    )
+    row = build_all_runs_export_df(runs, pd.DataFrame()).iloc[0]
+    assert row["COST_mapping_applied"] == 0
+    assert row["COST_power_usd"] == 10
+    assert row["COST_scrap_usd"] == 20
+    assert row["COST_additions_usd"] == 30
+    assert row["COST_other_consumables_reconstructed_usd"] == 40
 
 
 def test_chemistry_pass_is_not_mislabeled_as_overall_pass() -> None:

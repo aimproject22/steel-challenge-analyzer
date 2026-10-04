@@ -36,6 +36,22 @@ PROCESS_EAF = "Electric Arc Furnace"
 PROCESS_SECONDARY = "Secondary Steelmaking"
 
 
+def _record_section_diagnostics(data: dict, seen_sections: Iterable[str]) -> None:
+    """Persist enough provenance to distinguish absent and failed tables later."""
+
+    seen = set(seen_sections)
+    for section, label in ((SECTION_RAW, "Raw Materials"), (SECTION_ADD, "Additions")):
+        parsed = any(str(key).startswith(f"{section} > ") for key in data)
+        status = (
+            "REPORT_PARSED"
+            if parsed
+            else "REPORT_PARSE_FAILED"
+            if section in seen
+            else "REPORT_SECTION_MISSING"
+        )
+        data[f"Parser Diagnostics > {label} Parse Status"] = status
+
+
 def detect_process_type(*values: Any) -> str:
     """Identify the Steel University simulation without trusting the sender."""
 
@@ -213,6 +229,13 @@ def _finalize(
     process_type: str,
 ) -> tuple[dict, list[dict]]:
     data["Run Information > Process Type"] = process_type
+    seen_sections = {
+        section
+        for line in str(raw_text or "").splitlines()
+        for section in [canonical_section(line)]
+        if section
+    }
+    _record_section_diagnostics(data, seen_sections)
     data.update(build_structured_sections(data))
     logs = parse_event_log(raw_text)
     _validate_data(data, process_type)
@@ -325,6 +348,7 @@ def parse_html_body_many(
         for section, rows in group:
             _merge_section_rows(data, section, rows)
         data["Run Information > Process Type"] = process_type
+        _record_section_diagnostics(data, (section for section, _ in group))
         data.update(build_structured_sections(data))
         _validate_data(data, process_type)
         parsed_data.append(data)

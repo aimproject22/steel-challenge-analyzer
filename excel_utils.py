@@ -7,10 +7,13 @@ import re
 from io import BytesIO
 from typing import Any, Iterable, Mapping, Optional
 
+import numpy as np
 import pandas as pd
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold, cross_val_score
 
 from canonical import normalize_material_name
 from export_features import export_token, extract_event_export_features
@@ -36,16 +39,25 @@ CORE_PERF_COLUMNS = [
     "PERF_energy_kwh_per_t_error", "PERF_score",
 ]
 CORE_COST_COLUMNS = [
-    "COST_power_raw", "COST_scrap_raw", "COST_additions_raw",
-    "COST_other_consumables_raw", "COST_total_usd", "COST_per_tonne_usd",
-    "COST_power_corrected_usd", "COST_scrap_corrected_usd",
-    "COST_additions_corrected_usd", "COST_other_corrected_usd",
+    "COST_source_power_raw", "COST_source_scrap_raw",
+    "COST_source_additions_raw", "COST_source_other_consumables_raw",
+    "COST_total_usd", "COST_per_tonne_usd",
+    "COST_power_usd", "COST_scrap_usd", "COST_additions_usd",
+    "COST_other_consumables_reconstructed_usd", "COST_other_total_usd",
     "COST_reconstructed_total_usd",
     "COST_reconciliation_error_usd", "COST_reconciliation_error_pct",
-    "COST_detected_power_source", "COST_detected_scrap_source",
-    "COST_detected_additions_source", "COST_detected_other_source",
-    "COST_label_mismatch_detected", "COST_mapping_confidence",
-    "COST_mapping_warning",
+    "COST_source_scrap_is_time_duplicate", "COST_mapping_applied",
+    "COST_mapping_type", "COST_mapping_confidence", "COST_mapping_warning",
+    "COST_tapping_estimated_usd", "COST_oxygen_estimated_usd",
+    "COST_carbon_injection_estimated_usd",
+    "COST_electrode_breakage_estimated_usd", "COST_other_unexplained_usd",
+    "COST_other_model_name", "COST_other_model_sample_count",
+    "COST_other_model_cv_mae_usd", "COST_other_model_confidence",
+    "COST_electrode_breakage_unit_estimate_usd",
+    "COST_electrode_breakage_unit_mean_usd",
+    "COST_electrode_breakage_unit_std_usd",
+    "COST_electrode_breakage_unit_mad_usd",
+    "COST_electrode_breakage_model_confidence",
 ]
 CORE_QUALITY_COLUMNS = [
     "QUALITY_overall_pass", "QUALITY_full_validation_available",
@@ -55,10 +67,10 @@ CORE_QUALITY_COLUMNS = [
     "QUALITY_time_pass", "QUALITY_mass_pass", "QUALITY_co2_pass",
     "QUALITY_status_consistent", "QUALITY_status_matches_chemistry",
     "QUALITY_multi_run_merged_detected",
-    "QUALITY_rm_source", "QUALITY_rm_report_log_match",
+    "QUALITY_rm_source", "QUALITY_rm_parse_status", "QUALITY_rm_report_log_match",
     "QUALITY_rm_reconstruction_warning", "QUALITY_rm_total_report_t",
     "QUALITY_rm_total_log_t", "QUALITY_rm_total_difference_t",
-    "QUALITY_add_source", "QUALITY_add_report_log_match",
+    "QUALITY_add_source", "QUALITY_add_parse_status", "QUALITY_add_report_log_match",
     "QUALITY_add_reconstruction_warning", "QUALITY_add_total_report_kg",
     "QUALITY_add_total_log_kg", "QUALITY_add_total_difference_kg",
     "QUALITY_unknown_event_count", "QUALITY_warning_count",
@@ -66,7 +78,8 @@ CORE_QUALITY_COLUMNS = [
 ]
 GROUP_PREFIXES = (
     "RM_", "ADD_", "STEEL_", "SLAG_", "BASKET_", "PWR_", "O2_",
-    "CINJ_", "EVTADD_", "ANALYSIS_", "TAP_", "DERIVED_", "RAW_",
+    "CINJ_", "ELEC_", "FAIL_", "EVTADD_", "ANALYSIS_", "TAP_",
+    "DERIVED_", "RAW_",
 )
 
 
@@ -387,19 +400,28 @@ def _base_export_row(row: Mapping[str, Any]) -> dict[str, Any]:
             if reported_energy_per_t is not None and calculated_energy_per_t is not None else None
         ),
         "PERF_score": _number(_value(row, "Score", "Run Information > Score")),
-        "COST_power_raw": _number(_value(row, "Cost Breakdown > Power")),
-        "COST_scrap_raw": _number(_value(row, "Cost Breakdown > Scrap")),
-        "COST_additions_raw": _number(_value(row, "Cost Breakdown > Additions")),
-        "COST_other_consumables_raw": _number(_value(row, "Cost Breakdown > Other consumables")),
+        "COST_source_power_raw": _number(_value(row, "Cost Breakdown > Power")),
+        "COST_source_scrap_raw": _number(_value(row, "Cost Breakdown > Scrap")),
+        "COST_source_additions_raw": _number(_value(row, "Cost Breakdown > Additions")),
+        "COST_source_other_consumables_raw": _number(
+            _value(row, "Cost Breakdown > Other consumables")
+        ),
         "COST_total_usd": total_cost,
         "COST_per_tonne_usd": cost_per_tonne,
-        "COST_power_corrected_usd": None,
-        "COST_scrap_corrected_usd": None,
-        "COST_additions_corrected_usd": None,
-        "COST_other_corrected_usd": None,
+        "COST_power_usd": None,
+        "COST_scrap_usd": None,
+        "COST_additions_usd": None,
+        "COST_other_consumables_reconstructed_usd": None,
+        "COST_other_total_usd": None,
         "COST_reconstructed_total_usd": None,
         "COST_reconciliation_error_usd": None,
         "COST_reconciliation_error_pct": None,
+        "QUALITY_rm_parse_status": _value(
+            row, "Parser Diagnostics > Raw Materials Parse Status"
+        ),
+        "QUALITY_add_parse_status": _value(
+            row, "Parser Diagnostics > Additions Parse Status"
+        ),
     }
     result["DERIVED_energy_per_process_min"] = (
         total_energy / process_time if total_energy is not None and process_time not in (None, 0) else None
@@ -422,99 +444,107 @@ def _nearly_equal(left: Any, right: Any, *, absolute: float = 0.01) -> bool:
 
 
 def apply_cost_validation(export_row: dict[str, Any]) -> list[str]:
-    """Validate report labels without inventing material or electricity prices."""
+    """Preserve source labels and add an EAF-only semantic cost layer.
 
-    power = _number(export_row.get("COST_power_raw"))
-    scrap = _number(export_row.get("COST_scrap_raw"))
-    additions = _number(export_row.get("COST_additions_raw"))
-    other = _number(export_row.get("COST_other_consumables_raw"))
+    SteelUniversity's EAF result table is known to emit shifted labels.  The
+    raw values remain untouched; only the separate semantic fields below are
+    corrected.  No material or electricity unit price is assumed.
+    """
+
+    source_power = _number(export_row.get("COST_source_power_raw"))
+    source_scrap = _number(export_row.get("COST_source_scrap_raw"))
+    source_additions = _number(export_row.get("COST_source_additions_raw"))
+    source_other = _number(export_row.get("COST_source_other_consumables_raw"))
     total = _number(export_row.get("COST_total_usd"))
     process_time = _number(export_row.get("PERF_time_min"))
+    process_type = str(export_row.get("META_process_type") or "").casefold()
+    is_eaf = "electric arc furnace" in process_type
     warnings: list[str] = []
-    if all(value is None for value in (power, scrap, additions, other, total)):
+    if all(
+        value is None
+        for value in (source_power, source_scrap, source_additions, source_other, total)
+    ):
         export_row.update(
             {
-                "COST_label_mismatch_detected": None,
+                "COST_source_scrap_is_time_duplicate": None,
+                "COST_mapping_applied": None,
+                "COST_mapping_type": "MISSING",
                 "COST_mapping_confidence": "MISSING",
                 "COST_mapping_warning": None,
             }
         )
         return warnings
-    time_collision = scrap is not None and _nearly_equal(scrap, process_time)
-    meaningful = [value for value in (power, additions, other) if value is not None]
-    residual = total - sum(meaningful) if total is not None and len(meaningful) == 3 else None
-
-    if (
-        time_collision
-        and len(meaningful) == 3
-        and total is not None
-        and residual is not None
-        and residual >= -max(1.0, abs(total) * 0.001)
-        and residual <= max(1_000.0, abs(total) * 0.10)
-    ):
-        if _nearly_equal(residual, 0.0, absolute=0.1):
-            residual = 0.0
-        corrected = {
-            "COST_power_corrected_usd": other,
-            "COST_scrap_corrected_usd": additions,
-            "COST_additions_corrected_usd": power,
-            "COST_other_corrected_usd": residual,
-            "COST_detected_power_source": "Cost Breakdown > Other consumables",
-            "COST_detected_scrap_source": "Cost Breakdown > Additions",
-            "COST_detected_additions_source": "Cost Breakdown > Power",
-            "COST_detected_other_source": "TOTAL_RESIDUAL",
-            "COST_label_mismatch_detected": 1,
-            "COST_mapping_confidence": (
-                "HIGH_INTERNAL_RECONCILIATION"
-                if abs(residual) <= max(1.0, abs(total) * 0.001)
-                else "MEDIUM_TOTAL_RESIDUAL"
-            ),
-            "COST_mapping_warning": (
-                "Report cost labels appear shifted; Scrap raw equals process time. "
-                "Corrected mapping uses the report total residual and no invented prices."
-            ),
-        }
-        warnings.append("Cost label mismatch detected and internally reconciled")
+    time_collision = (
+        source_scrap is not None and _nearly_equal(source_scrap, process_time)
+    )
+    corrected: dict[str, Any] = {
+        "COST_source_scrap_is_time_duplicate": int(time_collision),
+    }
+    if is_eaf:
+        required = (source_power, source_additions, source_other, total)
+        if all(value is not None for value in required):
+            residual = total - source_power - source_additions - source_other
+            if _nearly_equal(residual, 0.0, absolute=0.1):
+                residual = 0.0
+            corrected.update(
+                {
+                    "COST_power_usd": source_other,
+                    "COST_scrap_usd": source_additions,
+                    "COST_additions_usd": source_power,
+                    "COST_other_consumables_reconstructed_usd": residual,
+                    "COST_other_total_usd": residual,
+                    "COST_mapping_applied": 1,
+                    "COST_mapping_type": "STEELUNIVERSITY_EAF_KNOWN_SHIFT",
+                    "COST_mapping_confidence": (
+                        "HIGH" if time_collision and residual >= -0.01 else "MEDIUM"
+                    ),
+                    "COST_mapping_warning": (
+                        "Known SteelUniversity EAF source-label shift corrected in the "
+                        "semantic layer; raw labels are preserved."
+                        + (
+                            " Source Scrap duplicates reported process time."
+                            if time_collision
+                            else " Source Scrap did not duplicate reported process time."
+                        )
+                    ),
+                }
+            )
+            warnings.append("Known EAF cost label shift mapped to semantic costs")
+            if residual < -0.01:
+                warnings.append("Reconstructed Other consumables is negative")
+        else:
+            corrected.update(
+                {
+                    "COST_mapping_applied": 0,
+                    "COST_mapping_type": "STEELUNIVERSITY_EAF_INCOMPLETE_SOURCE",
+                    "COST_mapping_confidence": "UNRESOLVED",
+                    "COST_mapping_warning": "EAF cost mapping requires all source cost fields and Total Cost",
+                }
+            )
+            warnings.append(str(corrected["COST_mapping_warning"]))
     else:
-        all_raw = [value for value in (power, scrap, additions, other) if value is not None]
-        if (
-            len(all_raw) == 4
-            and total is not None
-            and _nearly_equal(sum(all_raw), total, absolute=0.1)
-        ):
-            corrected = {
-                "COST_power_corrected_usd": power,
-                "COST_scrap_corrected_usd": scrap,
-                "COST_additions_corrected_usd": additions,
-                "COST_other_corrected_usd": other,
-                "COST_detected_power_source": "Cost Breakdown > Power",
-                "COST_detected_scrap_source": "Cost Breakdown > Scrap",
-                "COST_detected_additions_source": "Cost Breakdown > Additions",
-                "COST_detected_other_source": "Cost Breakdown > Other consumables",
-                "COST_label_mismatch_detected": 0,
-                "COST_mapping_confidence": "REPORT_TOTAL_RECONCILED",
+        corrected.update(
+            {
+                "COST_power_usd": source_power,
+                "COST_scrap_usd": source_scrap,
+                "COST_additions_usd": source_additions,
+                "COST_other_consumables_reconstructed_usd": source_other,
+                "COST_other_total_usd": source_other,
+                "COST_mapping_applied": 0,
+                "COST_mapping_type": "SOURCE_LABELS_AS_REPORTED",
+                "COST_mapping_confidence": "REPORT",
                 "COST_mapping_warning": None,
             }
-        else:
-            corrected = {
-                "COST_label_mismatch_detected": int(time_collision),
-                "COST_mapping_confidence": "UNRESOLVED",
-                "COST_mapping_warning": (
-                    "Scrap raw equals process time; corrected costs left blank"
-                    if time_collision
-                    else "Cost labels could not be independently validated"
-                ),
-            }
-            warnings.append(str(corrected["COST_mapping_warning"]))
+        )
 
     export_row.update(corrected)
     corrected_values = [
         _number(export_row.get(column))
         for column in (
-            "COST_power_corrected_usd",
-            "COST_scrap_corrected_usd",
-            "COST_additions_corrected_usd",
-            "COST_other_corrected_usd",
+            "COST_power_usd",
+            "COST_scrap_usd",
+            "COST_additions_usd",
+            "COST_other_consumables_reconstructed_usd",
         )
     ]
     if all(value is not None for value in corrected_values):
@@ -527,6 +557,175 @@ def apply_cost_validation(export_row: dict[str, Any]) -> list[str]:
                 error / total * 100.0 if total != 0 else None
             )
     return warnings
+
+
+def _model_feature_value(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Return numeric model input while distinguishing measured zero from missing."""
+
+    source = frame[column] if column in frame else pd.Series(np.nan, index=frame.index)
+    values = pd.to_numeric(source, errors="coerce")
+    if column == "O2_integrated_Nm3" and "O2_used" in frame:
+        values = values.mask(values.isna() & frame["O2_used"].eq(0), 0.0)
+    if column == "CINJ_integrated_kg" and "CINJ_used" in frame:
+        values = values.mask(values.isna() & frame["CINJ_used"].eq(0), 0.0)
+    return values
+
+
+def apply_other_consumables_decomposition(frame: pd.DataFrame) -> pd.DataFrame:
+    """Estimate Other-consumable components only when the dataset identifies them.
+
+    Candidate non-negative models are fitted on EAF runs without electrode breaks.
+    If the sample is insufficient, component estimates stay blank and the full
+    residual remains unexplained.  This deliberately avoids hard-coded prices.
+    """
+
+    if frame.empty or "COST_other_total_usd" not in frame:
+        return frame
+    result = frame.copy()
+    target = pd.to_numeric(result["COST_other_total_usd"], errors="coerce")
+    break_source = (
+        result["ELEC_break_count"]
+        if "ELEC_break_count" in result
+        else pd.Series(0.0, index=result.index)
+    )
+    breaks = pd.to_numeric(break_source, errors="coerce").fillna(0)
+    is_eaf = result.get("META_process_type", pd.Series("", index=result.index)).fillna("").astype(str).str.contains(
+        "electric arc furnace", case=False, regex=False
+    )
+    oxygen = _model_feature_value(result, "O2_integrated_Nm3")
+    carbon = _model_feature_value(result, "CINJ_integrated_kg")
+    tapping_mass = pd.to_numeric(
+        result["PERF_tapping_mass_t"]
+        if "PERF_tapping_mass_t" in result
+        else pd.Series(np.nan, index=result.index),
+        errors="coerce",
+    )
+    tapping_duration = pd.to_numeric(
+        result["TAP_duration_sec"]
+        if "TAP_duration_sec" in result
+        else pd.Series(np.nan, index=result.index),
+        errors="coerce",
+    )
+
+    candidates = {
+        "BASE_O2_C": [("base", pd.Series(1.0, index=result.index)), ("oxygen", oxygen), ("carbon", carbon)],
+        "TAP_MASS_O2_C": [("tapping", tapping_mass), ("oxygen", oxygen), ("carbon", carbon)],
+        "TAP_DURATION_O2_C": [("tapping", tapping_duration), ("oxygen", oxygen), ("carbon", carbon)],
+    }
+    best: Optional[dict[str, Any]] = None
+    for name, features in candidates.items():
+        model_frame = pd.DataFrame(
+            {feature_name: values for feature_name, values in features},
+            index=result.index,
+        )
+        eligible = is_eaf & breaks.eq(0) & target.ge(0) & target.notna()
+        eligible &= model_frame.notna().all(axis=1)
+        x = model_frame.loc[eligible]
+        y = target.loc[eligible]
+        if len(x) < max(8, len(features) + 3):
+            continue
+        model = LinearRegression(positive=True, fit_intercept=False)
+        folds = min(5, len(x))
+        splitter = KFold(n_splits=folds, shuffle=True, random_state=42)
+        mae = float(
+            -cross_val_score(
+                model,
+                x.to_numpy(dtype=float),
+                y.to_numpy(dtype=float),
+                cv=splitter,
+                scoring="neg_mean_absolute_error",
+            ).mean()
+        )
+        model.fit(x.to_numpy(dtype=float), y.to_numpy(dtype=float))
+        candidate = {
+            "name": name,
+            "features": features,
+            "columns": list(x.columns),
+            "model": model,
+            "mae": mae,
+            "sample_count": len(x),
+            "score": mae * (1.0 + 0.02 * len(features)),
+        }
+        if best is None or candidate["score"] < best["score"]:
+            best = candidate
+
+    component_columns = (
+        "COST_tapping_estimated_usd",
+        "COST_oxygen_estimated_usd",
+        "COST_carbon_injection_estimated_usd",
+        "COST_electrode_breakage_estimated_usd",
+        "COST_other_unexplained_usd",
+    )
+    for column in component_columns:
+        result[column] = np.nan
+    if best is None:
+        result["COST_other_unexplained_usd"] = target
+        result.loc[is_eaf, "COST_other_model_name"] = "UNAVAILABLE"
+        result.loc[is_eaf, "COST_other_model_sample_count"] = int(
+            (is_eaf & breaks.eq(0) & target.notna()).sum()
+        )
+        result["COST_other_model_cv_mae_usd"] = np.nan
+        result.loc[is_eaf, "COST_other_model_confidence"] = "INSUFFICIENT_DATA"
+        result.loc[
+            is_eaf, "COST_electrode_breakage_model_confidence"
+        ] = "INSUFFICIENT_DATA"
+        return result
+
+    coefficients = dict(zip(best["columns"], best["model"].coef_))
+    tapping_component = pd.Series(0.0, index=result.index)
+    if best["name"] == "BASE_O2_C":
+        tapping_component[:] = float(coefficients.get("base", 0.0))
+    elif best["name"] == "TAP_MASS_O2_C":
+        tapping_component = tapping_mass * float(coefficients.get("tapping", 0.0))
+    else:
+        tapping_component = tapping_duration * float(coefficients.get("tapping", 0.0))
+    oxygen_component = oxygen * float(coefficients.get("oxygen", 0.0))
+    carbon_component = carbon * float(coefficients.get("carbon", 0.0))
+    base_total = tapping_component + oxygen_component + carbon_component
+
+    break_eligible = is_eaf & breaks.gt(0) & target.notna() & base_total.notna()
+    unit_estimates = ((target - base_total) / breaks).loc[break_eligible]
+    unit_estimates = unit_estimates[unit_estimates.ge(0)]
+    unit_median = float(unit_estimates.median()) if len(unit_estimates) else np.nan
+    unit_mean = float(unit_estimates.mean()) if len(unit_estimates) else np.nan
+    unit_std = float(unit_estimates.std(ddof=0)) if len(unit_estimates) else np.nan
+    unit_mad = (
+        float((unit_estimates - unit_median).abs().median())
+        if len(unit_estimates)
+        else np.nan
+    )
+    electrode_component = breaks * unit_median if math.isfinite(unit_median) else pd.Series(np.nan, index=result.index)
+    electrode_component = electrode_component.where(breaks.gt(0), 0.0)
+    explained = base_total + electrode_component
+    valid_prediction = is_eaf & target.notna() & base_total.notna()
+    confidence = (
+        "HIGH" if best["sample_count"] >= 30 and best["mae"] <= max(5.0, float(target.median()) * 0.05)
+        else "MEDIUM" if best["sample_count"] >= 15
+        else "LOW"
+    )
+    electrode_confidence = (
+        "HIGH" if len(unit_estimates) >= 5 and unit_mad <= max(5.0, abs(unit_median) * 0.15)
+        else "MEDIUM" if len(unit_estimates) >= 3
+        else "LOW" if len(unit_estimates) >= 1
+        else "INSUFFICIENT_DATA"
+    )
+    result.loc[valid_prediction, "COST_tapping_estimated_usd"] = tapping_component
+    result.loc[valid_prediction, "COST_oxygen_estimated_usd"] = oxygen_component
+    result.loc[valid_prediction, "COST_carbon_injection_estimated_usd"] = carbon_component
+    result.loc[valid_prediction, "COST_electrode_breakage_estimated_usd"] = electrode_component
+    result.loc[valid_prediction, "COST_other_unexplained_usd"] = target - explained
+    result.loc[is_eaf, "COST_other_model_name"] = best["name"]
+    result.loc[is_eaf, "COST_other_model_sample_count"] = best["sample_count"]
+    result.loc[is_eaf, "COST_other_model_cv_mae_usd"] = best["mae"]
+    result.loc[is_eaf, "COST_other_model_confidence"] = confidence
+    result.loc[is_eaf, "COST_electrode_breakage_unit_estimate_usd"] = unit_median
+    result.loc[is_eaf, "COST_electrode_breakage_unit_mean_usd"] = unit_mean
+    result.loc[is_eaf, "COST_electrode_breakage_unit_std_usd"] = unit_std
+    result.loc[is_eaf, "COST_electrode_breakage_unit_mad_usd"] = unit_mad
+    result.loc[
+        is_eaf, "COST_electrode_breakage_model_confidence"
+    ] = electrode_confidence
+    return result
 
 
 def _detail_values(
@@ -595,6 +794,7 @@ def apply_material_fallbacks(export_row: dict[str, Any]) -> list[str]:
     )
 
     if report_rm:
+        export_row["QUALITY_rm_parse_status"] = "REPORT_PARSED"
         match = _material_match(report_rm, logged_rm) if logged_rm else None
         export_row["QUALITY_rm_source"] = (
             "REPORT_AND_LOG_VERIFIED" if match else "REPORT"
@@ -609,13 +809,17 @@ def apply_material_fallbacks(export_row: dict[str, Any]) -> list[str]:
         export_row["RM_total_mass_t"] = rm_log_total
         export_row["RM_nonzero_material_count"] = sum(value != 0 for value in logged_rm.values())
         export_row["QUALITY_rm_source"] = "EVENT_LOG_RECONSTRUCTED"
+        export_row["QUALITY_rm_parse_status"] = "EVENT_RECONSTRUCTED"
         export_row["QUALITY_rm_reconstruction_warning"] = "Report RM missing; reconstructed from Event Log"
     else:
         export_row["QUALITY_rm_source"] = "MISSING"
+        if not export_row.get("QUALITY_rm_parse_status"):
+            export_row["QUALITY_rm_parse_status"] = "MISSING"
         export_row["QUALITY_rm_reconstruction_warning"] = "Raw Materials unavailable"
         warnings.append("Raw Materials missing")
 
     if report_add:
+        export_row["QUALITY_add_parse_status"] = "REPORT_PARSED"
         match = _material_match(report_add, logged_add) if logged_add else None
         export_row["QUALITY_add_source"] = (
             "REPORT_AND_LOG_VERIFIED" if match else "REPORT"
@@ -630,9 +834,12 @@ def apply_material_fallbacks(export_row: dict[str, Any]) -> list[str]:
         export_row["ADD_total_kg"] = add_log_total
         export_row["ADD_nonzero_count"] = sum(value != 0 for value in logged_add.values())
         export_row["QUALITY_add_source"] = "EVENT_LOG_RECONSTRUCTED"
+        export_row["QUALITY_add_parse_status"] = "EVENT_RECONSTRUCTED"
         export_row["QUALITY_add_reconstruction_warning"] = "Report additions missing; reconstructed from Event Log"
     else:
         export_row["QUALITY_add_source"] = "MISSING"
+        if not export_row.get("QUALITY_add_parse_status"):
+            export_row["QUALITY_add_parse_status"] = "MISSING"
         export_row["QUALITY_add_reconstruction_warning"] = "Additions unavailable"
     return warnings
 
@@ -793,6 +1000,7 @@ def build_all_runs_export_df(
             columns=CORE_META_COLUMNS + CORE_PERF_COLUMNS + CORE_COST_COLUMNS + CORE_QUALITY_COLUMNS
         )
         return frame
+    frame = apply_other_consumables_decomposition(frame)
     frame, _ = drop_all_null_export_columns(frame)
     frame, _ = drop_redundant_export_columns(frame)
     return frame.reindex(columns=_column_order(frame.columns))
@@ -810,7 +1018,8 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
         "QUALITY_": "7F1D1D", "RM_": "355E3B", "ADD_": "526D82",
         "STEEL_": "4C566A", "SLAG_": "5B4B8A", "BASKET_": "6B5B3E",
         "PWR_": "9A3412", "O2_": "0369A1", "CINJ_": "374151",
-        "EVTADD_": "7C3AED", "ANALYSIS_": "0F766E", "TAP_": "B45309",
+        "ELEC_": "991B1B", "FAIL_": "991B1B", "EVTADD_": "7C3AED",
+        "ANALYSIS_": "0F766E", "TAP_": "B45309",
         "DERIVED_": "475569", "RAW_": "334155",
     }
     for cell in worksheet[1]:
@@ -842,7 +1051,7 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
                 cell.alignment = Alignment(vertical="center", wrap_text=False)
 
     def detail_column(column: str) -> bool:
-        if column.startswith(("EVTADD_", "ANALYSIS_", "DERIVED_", "RAW_")):
+        if column.startswith(("ELEC_", "FAIL_", "EVTADD_", "ANALYSIS_", "DERIVED_", "RAW_")):
             return True
         if column.startswith(("STEEL_", "SLAG_")):
             return column.endswith(
@@ -927,7 +1136,7 @@ def summarize_export_frame(frame: pd.DataFrame) -> dict[str, int]:
         ),
         "cost_mapping_warnings": int(
             pd.to_numeric(
-                frame.get("COST_label_mismatch_detected", pd.Series(dtype=float)),
+                frame.get("COST_mapping_applied", pd.Series(dtype=float)),
                 errors="coerce",
             ).fillna(0).sum()
         ),

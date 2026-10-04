@@ -222,12 +222,24 @@ def parse_docx_canonical(uploaded_file: Any) -> ParsedRun:
                 else:
                     data[key] = value
 
-    required = {SECTION_RUN, SECTION_SIM, SECTION_COST, SECTION_STEEL, SECTION_ADD, SECTION_SLAG}
+    # Raw Materials and Additions may be absent in otherwise valid EAF reports;
+    # the export layer can reconstruct both from the Event Log.
+    required = {SECTION_RUN, SECTION_SIM, SECTION_COST, SECTION_STEEL, SECTION_SLAG}
     missing = sorted(required - seen_sections)
     if missing:
         raise ValueError(f"필수 섹션이 없습니다: {', '.join(missing)}")
     if SECTION_RAW not in seen_sections:
         warnings.append("Raw Materials 섹션이 없습니다.")
+
+    for section, label in ((SECTION_RAW, "Raw Materials"), (SECTION_ADD, "Additions")):
+        parsed = any(str(key).startswith(f"{section} > ") for key in data)
+        data[f"Parser Diagnostics > {label} Parse Status"] = (
+            "REPORT_PARSED"
+            if parsed
+            else "REPORT_PARSE_FAILED"
+            if section in seen_sections
+            else "REPORT_SECTION_MISSING"
+        )
 
     data.update(build_structured_sections(data))
     logs = parse_event_log(doc)

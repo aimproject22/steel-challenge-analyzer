@@ -267,18 +267,31 @@ Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. �
 
 - 한 Simulation Run은 정확히 한 행입니다.
 - 열은 `META_`, `PERF_`, `COST_`, `QUALITY_`, `RM_`, `ADD_`, `STEEL_`,
-  `SLAG_`, `BASKET_`, `PWR_`, `O2_`, `CINJ_`, `EVTADD_`, `ANALYSIS_`,
-  `TAP_`, `DERIVED_`, `RAW_` 그룹 순으로 정렬됩니다.
+  `SLAG_`, `BASKET_`, `PWR_`, `O2_`, `CINJ_`, `ELEC_`, `EVTADD_`,
+  `ANALYSIS_`, `TAP_`, `DERIVED_`, `RAW_` 그룹 순으로 정렬됩니다.
 - Raw Materials, Additions, Steel/Slag Composition은 Run별 wide format으로
   정리됩니다. 새 material, element, power setpoint는 union schema에 동적으로
   추가되며 동일 schema의 열 순서는 항상 같습니다.
 - Report Raw Materials/Additions가 없으면 Event Log의 Basket/Additions를 합산해
   복원하고 `QUALITY_rm_source`, `QUALITY_add_source`에 provenance를 기록합니다.
   같은 Basket 안에 같은 재료가 반복되면 마지막 값으로 덮지 않고 합산합니다.
-- Cost Breakdown raw label은 그대로 보존합니다. Scrap raw가 process time과 같고
-  나머지 세 raw 값이 Total Cost와 내부적으로 일치하는 알려진 label-shift 패턴만
-  corrected cost로 재배치합니다. 공식 가격 master가 없으므로 단가 기반 비용은
-  임의 계산하지 않습니다.
+  새로 수집한 Run은 `QUALITY_rm_parse_status`, `QUALITY_add_parse_status`로
+  report parsed/section missing/parse failed/event reconstructed 상태도 구분합니다.
+- EAF Cost Breakdown은 SteelUniversity 원본의 알려진 label shift로 처리합니다.
+  `COST_source_*_raw` 네 열은 그대로 보존하고 EAF에서만
+  `source Other→COST_power_usd`, `source Additions→COST_scrap_usd`,
+  `source Power→COST_additions_usd`로 의미를 교정합니다. source Scrap은
+  process time 중복 여부만 검증하고 비용에는 사용하지 않습니다. 실제 Other는
+  Total Cost residual인 `COST_other_consumables_reconstructed_usd`로 복원하며
+  `COST_mapping_type=STEELUNIVERSITY_EAF_KNOWN_SHIFT`로 provenance를 남깁니다.
+  Secondary Steelmaking 등 다른 공정에는 이 mapping을 적용하지 않습니다.
+- Other consumables 세부 비용은 전극 파손이 없는 Run으로 non-negative 후보 모델을
+  비교할 만큼 표본이 있을 때만 Tapping/Oxygen/Carbon으로 추정합니다. 전극 파손
+  비용은 해당 baseline의 잔차에서 데이터 기반으로 추정하며, 표본이 부족하면
+  임의 단가를 만들지 않고 `INSUFFICIENT_DATA`와 unexplained residual을 남깁니다.
+- `Electrode breakage`와 replacement 문구는 FIFO로 대응하여 `ELEC_break_count`,
+  `ELEC_total_downtime_sec` 등을 계산합니다. 대응되지 않는 event는 warning과 raw
+  log에 보존합니다.
 - `QUALITY_chemistry_pass`는 Steel/Slag chemistry만 뜻합니다. 온도·시간·질량·CO2
   spec이 모두 확인되지 않으면 `QUALITY_full_validation_available=0`이고
   `QUALITY_overall_pass`는 생성하지 않습니다.

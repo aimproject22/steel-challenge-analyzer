@@ -31,6 +31,16 @@ CARBON_PATTERN = re.compile(
     r"\s*:?\s*\(?([-+]?\d[\d,]*(?:\.\d+)?)\s*(?:kg\s*/?\s*min)?",
     re.I,
 )
+ELECTRODE_BREAK_PATTERN = re.compile(
+    r"(?:\belectrode\b.*\b(?:break(?:age)?|broke|broken|failure)\b|"
+    r"\b(?:break(?:age)?|broke|broken|failure)\b.*\belectrode\b)",
+    re.I,
+)
+ELECTRODE_REPLACEMENT_PATTERN = re.compile(
+    r"(?:\b(?:broken\s+)?electrode\b.*\b(?:replaced|replacement|changed|installed)\b|"
+    r"\b(?:replaced|replacement|changed|installed)\b.*\belectrode\b)",
+    re.I,
+)
 MATERIAL_ITEM_PATTERN = re.compile(
     r"^\s*(.+?)(?:\s*:\s*|\s+)([-+]?\d[\d,]*(?:\.\d+)?)\s*(kg|t)\s*$",
     re.I,
@@ -189,6 +199,10 @@ def _compact_event(event: str) -> Optional[str]:
         return "ANALYSIS_REQUEST"
     if "analysis received" in lower:
         return "ANALYSIS_RECEIVED"
+    if ELECTRODE_REPLACEMENT_PATTERN.search(event):
+        return "ELECTRODE_REPLACED"
+    if ELECTRODE_BREAK_PATTERN.search(event):
+        return "ELECTRODE_BREAK"
     if "tapping start" in lower:
         return "TAPPING_START"
     if "tapping complete" in lower:
@@ -204,6 +218,8 @@ def _is_known_event(event: str) -> bool:
         or "simulation rate" in lower
         or "selected user" in lower
         or "selected steel" in lower
+        or ELECTRODE_BREAK_PATTERN.search(event)
+        or ELECTRODE_REPLACEMENT_PATTERN.search(event)
     )
 
 
@@ -227,6 +243,10 @@ def extract_event_export_features(
     """Build dynamic wide-format process features for one simulation run."""
 
     events = ordered_logs(logs)
+    complete_event_log = any(
+        "tapping complete" in str(item.get("event") or "").casefold()
+        for item in events
+    )
     end_seconds = _process_end_seconds(events, reported_time_minutes)
     result: dict[str, Any] = {}
     warnings: list[str] = []
@@ -259,11 +279,15 @@ def extract_event_export_features(
             "O2_used": int(has_oxygen),
             "O2_first_on_sec": oxygen["first_on"],
             "O2_last_off_sec": oxygen["last_off"],
-            "O2_total_on_sec": oxygen["on_seconds"] if has_oxygen else None,
+            "O2_total_on_sec": oxygen["on_seconds"] if has_oxygen else (0.0 if complete_event_log else None),
             "O2_max_flow_Nm3_min": oxygen["max"] if has_oxygen else None,
             "O2_time_weighted_avg_flow_Nm3_min": oxygen["weighted_average"],
             "O2_change_count": oxygen["change_count"],
-            "O2_integrated_Nm3": oxygen["integrated"] / 60.0 if has_oxygen else None,
+            "O2_integrated_Nm3": (
+                oxygen["integrated"] / 60.0
+                if has_oxygen
+                else (0.0 if complete_event_log else None)
+            ),
         }
     )
 
@@ -280,10 +304,14 @@ def extract_event_export_features(
             "CINJ_used": int(has_carbon),
             "CINJ_first_on_sec": carbon["first_on"],
             "CINJ_last_off_sec": carbon["last_off"],
-            "CINJ_total_on_sec": carbon["on_seconds"] if has_carbon else None,
+            "CINJ_total_on_sec": carbon["on_seconds"] if has_carbon else (0.0 if complete_event_log else None),
             "CINJ_max_flow": carbon["max"] if has_carbon else None,
             "CINJ_time_weighted_avg_flow": carbon["weighted_average"],
-            "CINJ_integrated_kg": carbon["integrated"] / 60.0 if has_carbon else None,
+            "CINJ_integrated_kg": (
+                carbon["integrated"] / 60.0
+                if has_carbon
+                else (0.0 if complete_event_log else None)
+            ),
             "CINJ_change_count": carbon["change_count"],
         }
     )
@@ -299,6 +327,10 @@ def extract_event_export_features(
     analysis_waits: list[float] = []
     tapping_start: Optional[float] = None
     tapping_complete: Optional[float] = None
+    electrode_breaks: list[float] = []
+    electrode_replacements: list[float] = []
+    unmatched_breaks: deque[float] = deque()
+    electrode_downtimes: list[float] = []
     compact_sequence: list[str] = []
     raw_lines: list[str] = []
     unknown_lines: list[str] = []
@@ -353,6 +385,21 @@ def extract_event_export_features(
                 analysis_waits.append(max(0.0, seconds - analysis_requests.popleft()))
             else:
                 warnings.append("Analysis received without matching request")
+        # Check replacement before break: phrases such as "Broken electrode has
+        # been replaced" contain both concepts but represent only replacement.
+        if seconds is not None and ELECTRODE_REPLACEMENT_PATTERN.search(event):
+            electrode_replacements.append(seconds)
+            if unmatched_breaks:
+                break_seconds = unmatched_breaks.popleft()
+                if seconds >= break_seconds:
+                    electrode_downtimes.append(seconds - break_seconds)
+                else:
+                    warnings.append("Electrode replacement precedes paired break")
+            else:
+                warnings.append("Electrode replacement without matching break")
+        elif seconds is not None and ELECTRODE_BREAK_PATTERN.search(event):
+            electrode_breaks.append(seconds)
+            unmatched_breaks.append(seconds)
         if "tapping start" in lower and tapping_start is None:
             tapping_start = seconds
         if "tapping complete" in lower and tapping_complete is None:
@@ -360,6 +407,8 @@ def extract_event_export_features(
 
     if analysis_requests:
         warnings.append(f"{len(analysis_requests)} analysis request(s) without result")
+    if unmatched_breaks:
+        warnings.append(f"{len(unmatched_breaks)} electrode break(s) without replacement")
 
     result["BASKET_count"] = len(basket_times)
     result["BASKET_total_charged_t"] = basket_total if basket_times else None
@@ -416,6 +465,35 @@ def extract_event_export_features(
                 (tapping_complete - tapping_start) / 60.0
                 if tapping_start is not None and tapping_complete is not None
                 else None
+            ),
+            "ELEC_break_count": len(electrode_breaks),
+            "ELEC_first_break_sec": electrode_breaks[0] if electrode_breaks else None,
+            "ELEC_last_break_sec": electrode_breaks[-1] if electrode_breaks else None,
+            "ELEC_replacement_count": len(electrode_replacements),
+            "ELEC_first_replacement_sec": (
+                electrode_replacements[0] if electrode_replacements else None
+            ),
+            "ELEC_last_replacement_sec": (
+                electrode_replacements[-1] if electrode_replacements else None
+            ),
+            "ELEC_total_downtime_sec": (
+                sum(electrode_downtimes) if electrode_downtimes else None
+            ),
+            "ELEC_paired_event_count": len(electrode_downtimes),
+            "ELEC_unpaired_break_count": len(unmatched_breaks),
+            "ELEC_unpaired_replacement_count": max(
+                0, len(electrode_replacements) - len(electrode_downtimes)
+            ),
+            # Compatibility names used by earlier quality reports.
+            "FAIL_electrode_break_count": len(electrode_breaks),
+            "FAIL_electrode_break_first_sec": (
+                electrode_breaks[0] if electrode_breaks else None
+            ),
+            "FAIL_electrode_replaced_sec": (
+                electrode_replacements[0] if electrode_replacements else None
+            ),
+            "FAIL_electrode_downtime_sec": (
+                sum(electrode_downtimes) if electrode_downtimes else None
             ),
         }
     )
