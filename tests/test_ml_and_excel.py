@@ -9,7 +9,10 @@ from openpyxl import load_workbook
 
 from excel_utils import (
     apply_other_consumables_decomposition,
+    build_analysis_dataframe,
     build_all_runs_export_df,
+    build_excel_frames,
+    build_results_dataframe,
     make_excel,
 )
 from export_features import extract_event_export_features
@@ -51,7 +54,7 @@ def _headers(worksheet) -> dict[str, int]:
     }
 
 
-def test_excel_has_single_all_runs_sheet_and_sanitizes_strings() -> None:
+def test_excel_has_exact_two_sheets_and_sanitizes_strings() -> None:
     runs = pd.DataFrame(
         {
             "Run ID": [1],
@@ -64,16 +67,16 @@ def test_excel_has_single_all_runs_sheet_and_sanitizes_strings() -> None:
     )
     output = make_excel(runs, logs)
     workbook = load_workbook(BytesIO(output.getvalue()), read_only=False)
-    assert workbook.sheetnames == ["ALL_RUNS"]
-    worksheet = workbook["ALL_RUNS"]
-    assert worksheet.freeze_panes == "G2"
+    assert workbook.sheetnames == ["RESULTS", "ANALYSIS"]
+    worksheet = workbook["RESULTS"]
+    assert worksheet.freeze_panes == "B2"
     assert worksheet.auto_filter.ref == worksheet.dimensions
     headers = _headers(worksheet)
     assert worksheet.max_row == 2
-    assert worksheet.cell(2, headers["META_sender"]).value.startswith("'")
-    assert "\x00" not in worksheet.cell(2, headers["RAW_event_log_01"]).value
+    assert worksheet.cell(2, headers["Sender"]).value.startswith("'")
+    assert "\x00" not in worksheet.cell(2, headers["Event_Log_Raw_01"]).value
     assert worksheet.row_dimensions[2].height == 20
-    assert not worksheet.cell(2, headers["RAW_event_log_01"]).alignment.wrap_text
+    assert not worksheet.cell(2, headers["Event_Log_Raw_01"]).alignment.wrap_text
 
 
 def test_excel_two_runs_produce_two_rows_and_aggregate_logs() -> None:
@@ -88,11 +91,11 @@ def test_excel_two_runs_produce_two_rows_and_aggregate_logs() -> None:
     )
     output = make_excel(runs, logs)
     workbook = load_workbook(BytesIO(output.getvalue()), read_only=True)
-    worksheet = workbook["ALL_RUNS"]
+    worksheet = workbook["RESULTS"]
     headers = _headers(worksheet)
     assert worksheet.max_row == 3
-    assert "Power set to" in worksheet.cell(2, headers["RAW_event_log_01"]).value
-    assert "Tapping complete" in worksheet.cell(3, headers["RAW_event_log_01"]).value
+    assert "Power set to" in worksheet.cell(2, headers["Event_Log_Raw_01"]).value
+    assert "Tapping complete" in worksheet.cell(3, headers["Event_Log_Raw_01"]).value
 
 
 def test_dynamic_event_features_power_basket_addition_and_analysis() -> None:
@@ -477,7 +480,7 @@ def test_ml_roles_exclude_post_run_quality_features() -> None:
     ]
 
 
-def test_excel_collapses_detail_columns_but_keeps_core_visible() -> None:
+def test_excel_formats_both_public_sheets() -> None:
     runs = pd.DataFrame(
         {
             "Run ID": [1],
@@ -495,14 +498,13 @@ def test_excel_collapses_detail_columns_but_keeps_core_visible() -> None:
         }
     )
     workbook = load_workbook(BytesIO(make_excel(runs, logs).getvalue()))
-    worksheet = workbook["ALL_RUNS"]
-    headers = _headers(worksheet)
-    current_letter = worksheet.cell(1, headers["STEEL_C_wt_pct"]).column_letter
-    detail_letter = worksheet.cell(1, headers["STEEL_C_min"]).column_letter
-    raw_letter = worksheet.cell(1, headers["RAW_event_log_01"]).column_letter
-    assert not worksheet.column_dimensions[current_letter].hidden
-    assert worksheet.column_dimensions[detail_letter].hidden
-    assert worksheet.column_dimensions[raw_letter].hidden
+    for sheet_name in ("RESULTS", "ANALYSIS"):
+        worksheet = workbook[sheet_name]
+        assert worksheet.freeze_panes == "B2"
+        assert worksheet.auto_filter.ref == worksheet.dimensions
+        assert worksheet.sheet_view.showGridLines is False
+    headers = _headers(workbook["RESULTS"])
+    assert {"Steel_C", "Steel_C_Min", "Steel_C_Max"}.issubset(headers)
 
 
 def test_reference_success_run_is_preserved() -> None:
@@ -563,3 +565,143 @@ def test_reference_success_run_is_preserved() -> None:
     assert row["SLAG_Basicity"] == pytest.approx(1.70620239624785)
     assert row["QUALITY_rm_source"] == "REPORT_AND_LOG_VERIFIED"
     assert row["QUALITY_add_source"] == "REPORT_AND_LOG_VERIFIED"
+
+
+def test_public_results_contains_reported_values_only() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [1],
+            "Time": [42],
+            "Cost Breakdown > Power": [591.2],
+            "Cost Breakdown > Scrap": [42],
+            "Cost Breakdown > Additions": [16020],
+            "Cost Breakdown > Other consumables": [19300.85],
+            "Raw Materials > No1 Bundles": [89],
+            "Additions > Lime": [1430],
+            "Steel Composition > C > Current": [0.115],
+            "Steel Composition > C > Min": [0.1],
+            "Steel Composition > C > Max": [0.12],
+        }
+    )
+    logs = pd.DataFrame(
+        {
+            "run_id": [1],
+            "log_no": [1],
+            "time": ["00:10:00"],
+            "event": ["Power 120 MW"],
+        }
+    )
+    results = build_results_dataframe(runs, logs)
+    assert results.loc[0, "Reported_Power"] == pytest.approx(591.2)
+    assert results.loc[0, "Reported_Scrap"] == pytest.approx(42)
+    assert results.loc[0, "RM_No1_Bundles_t"] == 89
+    assert results.loc[0, "ADD_Lime_kg"] == 1430
+    assert results.loc[0, "Steel_C"] == pytest.approx(0.115)
+    forbidden = (
+        "QUALITY_", "BASKET_", "PWR_", "O2_", "CINJ_", "ELEC_",
+        "EVTADD_", "ANALYSIS_", "TAP_", "DERIVED_",
+    )
+    assert not any(column.startswith(forbidden) for column in results.columns)
+    assert not any("Corrected" in column or "Reconstructed" in column for column in results)
+
+
+def test_two_sheets_keep_identical_run_order_and_one_row_per_run() -> None:
+    runs = pd.DataFrame({"Run ID": [1003, 1001, 1002], "Status": [1, 0, 1]})
+    results, analysis = build_excel_frames(runs, pd.DataFrame())
+    assert results["Run_ID"].tolist() == [1003, 1001, 1002]
+    assert analysis["Run_ID"].tolist() == results["Run_ID"].tolist()
+    assert len(results) == len(analysis) == 3
+    assert not any(column.startswith("Event_Log_Raw_") for column in analysis)
+
+
+def test_rm_and_add_fallback_are_analysis_only() -> None:
+    runs = pd.DataFrame({"Run ID": [1]})
+    logs = pd.DataFrame(
+        {
+            "run_id": [1, 1, 1],
+            "log_no": [1, 2, 3],
+            "time": ["00:00:00", "00:10:00", "00:20:00"],
+            "event": [
+                "Scrap basket added with: No1 Bundles: 48t; No1 Bundles: 41t",
+                "Additions: Lime: 900kg; Lime: 530kg",
+                "Tapping complete",
+            ],
+        }
+    )
+    results, analysis = build_excel_frames(runs, logs)
+    assert not any(column.startswith("RM_") for column in results)
+    assert not any(column.startswith("ADD_") for column in results)
+    assert analysis.loc[0, "RM_Source"] == "EVENT_LOG_RECONSTRUCTED"
+    assert analysis.loc[0, "RM_Reconstructed_No1_Bundles_t"] == 89
+    assert analysis.loc[0, "ADD_Source"] == "EVENT_LOG_RECONSTRUCTED"
+    assert analysis.loc[0, "ADD_Reconstructed_Lime_kg"] == 1430
+
+
+def test_analysis_run_1021_cost_and_electrode_regression() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [1021],
+            "Process Type": ["Electric Arc Furnace"],
+            "Time": [70],
+            "Cost Breakdown > Power": [354.5],
+            "Cost Breakdown > Scrap": [70],
+            "Cost Breakdown > Additions": [16150],
+            "Cost Breakdown > Other consumables": [18968.24],
+            "Total Cost": [35771],
+        }
+    )
+    logs = pd.DataFrame(
+        {
+            "run_id": [1021, 1021, 1021],
+            "log_no": [1, 2, 3],
+            "time": ["00:34:54", "00:46:22", "01:10:20"],
+            "event": [
+                "Electrode breakage",
+                "Broken electrode has been replaced",
+                "Tapping complete",
+            ],
+        }
+    )
+    analysis = build_analysis_dataframe(runs, logs).iloc[0]
+    assert analysis["Corrected_Additions_Cost_USD"] == pytest.approx(354.5)
+    assert analysis["Corrected_Scrap_Cost_USD"] == pytest.approx(16150)
+    assert analysis["Corrected_Power_Cost_USD"] == pytest.approx(18968.24)
+    assert analysis["Other_Consumables_USD"] == pytest.approx(298.26)
+    assert analysis["Electrode_Break_Count"] == 1
+    assert analysis["Electrode_Total_Downtime_sec"] == 688
+
+
+def test_small_cost_residual_is_explicit_rounding_adjustment() -> None:
+    runs = pd.DataFrame(
+        {
+            "Run ID": [1],
+            "Process Type": ["Electric Arc Furnace"],
+            "Time": [42],
+            "Cost Breakdown > Power": [100],
+            "Cost Breakdown > Scrap": [42],
+            "Cost Breakdown > Additions": [200],
+            "Cost Breakdown > Other consumables": [300.31],
+            "Total Cost": [600],
+        }
+    )
+    row = build_analysis_dataframe(runs, pd.DataFrame()).iloc[0]
+    assert row["Other_Consumables_Raw_Residual"] == pytest.approx(-0.31)
+    assert row["Other_Consumables_USD"] == 0
+    assert row["Cost_Rounding_Adjustment_USD"] == pytest.approx(-0.31)
+
+
+def test_public_raw_event_chunks_preserve_all_text() -> None:
+    event = "Y" * 65_000
+    results = build_results_dataframe(
+        pd.DataFrame({"Run ID": [1]}),
+        pd.DataFrame(
+            {"run_id": [1], "log_no": [1], "time": ["00:00:00"], "event": [event]}
+        ),
+    )
+    columns = sorted(
+        (column for column in results if column.startswith("Event_Log_Raw_")),
+        key=lambda value: int(value.rsplit("_", 1)[1]),
+    )
+    assert len(columns) == 3
+    assert "".join(str(results.loc[0, column]) for column in columns) == f"00:00:00,{event}"
+    assert all(len(str(results.loc[0, column])) <= 30_000 for column in columns)

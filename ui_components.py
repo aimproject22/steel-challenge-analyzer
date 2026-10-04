@@ -33,8 +33,10 @@ from db_utils import (
 )
 from excel_utils import (
     build_all_runs_export_df,
-    make_excel_from_frame,
+    build_excel_frames,
+    make_excel_from_frames,
     summarize_export_frame,
+    summarize_export_frames,
 )
 from ml_engine import (
     estimate_model_uncertainty,
@@ -723,12 +725,12 @@ def _build_download(
         for value in runs.get("Run ID", pd.Series(dtype="int64")).dropna()
     ]
     logs = load_all_logs_df(context.client, run_ids=run_ids, max_rows=100000)
-    export_frame = build_all_runs_export_df(runs, logs)
-    summary = summarize_export_frame(export_frame)
+    results_frame, analysis_frame = build_excel_frames(runs, logs)
+    summary = summarize_export_frames(results_frame, analysis_frame)
     timestamp = datetime.now(SEOUL).strftime("%Y%m%d_%H%M%S")
     file_name = f"SteelChallenge_Master_{timestamp}.xlsx"
     return (
-        make_excel_from_frame(export_frame).getvalue(),
+        make_excel_from_frames(results_frame, analysis_frame).getvalue(),
         len(runs),
         len(logs),
         file_name,
@@ -757,7 +759,8 @@ def render_download(context: AuthContext) -> None:
         if "filtered_export" in st.session_state:
             data, run_count, log_count, file_name, summary = st.session_state["filtered_export"]
             st.caption(
-                f"{summary['columns']} columns · RM log 복원 {summary['rm_reconstructed']} · "
+                f"RESULTS {summary['results_columns']} / ANALYSIS {summary['analysis_columns']} columns · "
+                f"RM log 복원 {summary['rm_reconstructed']} · "
                 f"Addition log 복원 {summary['add_reconstructed']} · "
                 f"Cost mapping 경고 {summary['cost_mapping_warnings']} · "
                 f"병합 의심 {summary['merged_suspects']}"
@@ -780,7 +783,8 @@ def render_download(context: AuthContext) -> None:
         if "full_export" in st.session_state:
             data, run_count, log_count, file_name, summary = st.session_state["full_export"]
             st.caption(
-                f"{summary['columns']} columns · RM report {summary['rm_report']} / "
+                f"RESULTS {summary['results_columns']} / ANALYSIS {summary['analysis_columns']} columns · "
+                f"RM report {summary['rm_report']} / "
                 f"log 복원 {summary['rm_reconstructed']} · Addition report {summary['add_report']} / "
                 f"log 복원 {summary['add_reconstructed']} · Cost mapping 경고 "
                 f"{summary['cost_mapping_warnings']} · 병합 의심 {summary['merged_suspects']}"

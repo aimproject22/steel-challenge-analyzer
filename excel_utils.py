@@ -1,4 +1,10 @@
-"""Permission-neutral, single-sheet Excel generation helpers."""
+"""Permission-neutral Excel generation helpers.
+
+The workbook deliberately separates values reported by SteelUniversity from
+values reconstructed or calculated by this application.  The wide internal
+feature frame remains available for ML and diagnostics, but it is no longer
+the public Excel schema.
+"""
 
 from __future__ import annotations
 
@@ -1006,32 +1012,373 @@ def build_all_runs_export_df(
     return frame.reindex(columns=_column_order(frame.columns))
 
 
-def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
-    worksheet = writer.book["ALL_RUNS"]
-    worksheet.freeze_panes = "G2"
+RESULTS_CORE_COLUMNS = [
+    "Run_ID", "User_ID", "Run_Date", "Status", "Score", "User_Level",
+    "Steel_Grade", "Process_Type", "Source", "Source_Run_Index", "Sender",
+    "Sender_Email", "Time_min", "Tapping_Mass_t", "Tap_Temperature_C",
+    "Total_Energy_kWh", "Energy_kWh_per_t", "Reported_Power",
+    "Reported_Scrap", "Reported_Additions", "Reported_Other_Consumables",
+    "Total_Cost", "Cost_Per_Tonne",
+]
+
+
+def _reported_composition_columns(
+    row: Mapping[str, Any], section: str, label: str, nested_key: str
+) -> dict[str, Any]:
+    """Return only Current/Min/Max values present in the source result."""
+
+    result: dict[str, Any] = {}
+    for element, values in _composition_source(row, section, nested_key).items():
+        token = normalize_export_name(element)
+        for source_name, suffix in (("current", ""), ("min", "_Min"), ("max", "_Max")):
+            value = values.get(source_name)
+            if not _is_missing(value):
+                number = _number(value)
+                result[f"{label}_{token}{suffix}"] = number if number is not None else value
+    return result
+
+
+def _natural_column_key(value: str) -> list[tuple[int, Any]]:
+    return [
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", value)
+        if part
+    ]
+
+
+def build_results_dataframe(
+    runs_df: pd.DataFrame, logs_df: pd.DataFrame
+) -> pd.DataFrame:
+    """Build the human-readable source/report sheet without reconstruction."""
+
+    log_groups = aggregate_logs_by_run(logs_df)
+    records: list[dict[str, Any]] = []
+    for row in (runs_df if runs_df is not None else pd.DataFrame()).to_dict("records"):
+        base = _base_export_row(row)
+        record: dict[str, Any] = {
+            "Run_ID": base.get("META_run_id"),
+            "User_ID": base.get("META_steel_user_id"),
+            "Run_Date": base.get("META_run_date"),
+            "Status": base.get("META_status"),
+            "Score": base.get("META_score"),
+            "User_Level": base.get("META_user_level"),
+            "Steel_Grade": base.get("META_steel_grade"),
+            "Process_Type": base.get("META_process_type"),
+            "Source": base.get("META_source"),
+            "Source_Run_Index": base.get("META_source_run_index"),
+            "Sender": base.get("META_sender"),
+            "Sender_Email": base.get("META_sender_email"),
+            "Time_min": base.get("PERF_time_min"),
+            "Tapping_Mass_t": base.get("PERF_tapping_mass_t"),
+            "Tap_Temperature_C": base.get("PERF_tap_temperature_c"),
+            "Total_Energy_kWh": base.get("PERF_total_energy_kwh"),
+            "Energy_kWh_per_t": base.get("PERF_energy_kwh_per_t_reported"),
+            "Reported_Power": base.get("COST_source_power_raw"),
+            "Reported_Scrap": base.get("COST_source_scrap_raw"),
+            "Reported_Additions": base.get("COST_source_additions_raw"),
+            "Reported_Other_Consumables": base.get("COST_source_other_consumables_raw"),
+            "Total_Cost": base.get("COST_total_usd"),
+            "Cost_Per_Tonne": base.get("COST_per_tonne_usd"),
+        }
+        # These helpers inspect only the report tables.  Their summary fields
+        # are intentionally excluded so RESULTS contains only reported items.
+        materials, _ = build_material_columns(row)
+        additions, _ = build_addition_columns(row)
+        record.update(
+            (key, value)
+            for key, value in materials.items()
+            if key not in {"RM_total_mass_t", "RM_nonzero_material_count"}
+        )
+        record.update(
+            (key, value)
+            for key, value in additions.items()
+            if key not in {"ADD_total_kg", "ADD_nonzero_count"}
+        )
+        record.update(
+            _reported_composition_columns(
+                row, "Steel Composition", "Steel", "steel_composition"
+            )
+        )
+        record.update(
+            _reported_composition_columns(
+                row, "Slag Composition", "Slag", "slag_composition"
+            )
+        )
+        run_logs = log_groups.get(_run_key(record.get("Run_ID")), [])
+        raw = build_event_export_features(run_logs, row)
+        raw_columns = sorted(
+            (key for key in raw if key.startswith("RAW_event_log_")),
+            key=_natural_column_key,
+        )
+        for key in raw_columns:
+            record[key.replace("RAW_event_log_", "Event_Log_Raw_")] = raw[key]
+        records.append(record)
+
+    frame = pd.DataFrame(records)
+    if frame.empty:
+        return pd.DataFrame(columns=["Run_ID"])
+    frame, _ = drop_all_null_export_columns(frame)
+    groups = ("RM_", "ADD_", "Steel_", "Slag_", "Event_Log_Raw_")
+    ordered = [column for column in RESULTS_CORE_COLUMNS if column in frame]
+    for prefix in groups:
+        ordered.extend(
+            sorted(
+                (column for column in frame if column.startswith(prefix)),
+                key=_natural_column_key,
+            )
+        )
+    ordered.extend(column for column in frame if column not in ordered)
+    return frame.reindex(columns=ordered)
+
+
+ANALYSIS_FIELD_MAP = {
+    "COST_additions_usd": "Corrected_Additions_Cost_USD",
+    "COST_scrap_usd": "Corrected_Scrap_Cost_USD",
+    "COST_power_usd": "Corrected_Power_Cost_USD",
+    "COST_mapping_applied": "Cost_Mapping_Applied",
+    "COST_mapping_type": "Cost_Mapping_Type",
+    "COST_source_scrap_is_time_duplicate": "Reported_Scrap_Equals_Time",
+    "QUALITY_rm_source": "RM_Source",
+    "QUALITY_rm_report_log_match": "RM_Report_Log_Match",
+    "QUALITY_rm_total_log_t": "RM_Total_Event_t",
+    "QUALITY_add_source": "ADD_Source",
+    "QUALITY_add_report_log_match": "ADD_Report_Log_Match",
+    "QUALITY_add_total_log_kg": "ADD_Total_Event_kg",
+    "BASKET_count": "Basket_Count",
+    "BASKET_total_charged_t": "Basket_Total_Charged_t",
+    "PWR_first_on_sec": "Power_First_On_sec",
+    "PWR_last_change_sec": "Power_Last_Change_sec",
+    "PWR_max_mw": "Power_Max_MW",
+    "PWR_min_nonzero_mw": "Power_Min_Nonzero_MW",
+    "PWR_change_count": "Power_Change_Count",
+    "PWR_total_on_sec": "Power_Total_On_sec",
+    "PWR_total_off_sec": "Power_Total_Off_sec",
+    "PWR_time_weighted_avg_mw": "Power_Time_Weighted_Avg_MW",
+    "PWR_setpoint_integral_MW_min": "Power_Setpoint_Integral_MW_min",
+    "PWR_setpoint_equivalent_MWh": "Power_Setpoint_Equivalent_MWh",
+    "O2_used": "Oxygen_Used",
+    "O2_first_on_sec": "Oxygen_First_On_sec",
+    "O2_last_off_sec": "Oxygen_Last_Off_sec",
+    "O2_total_on_sec": "Oxygen_Total_On_sec",
+    "O2_max_flow_Nm3_min": "Oxygen_Max_Flow_Nm3_min",
+    "O2_integrated_Nm3": "Oxygen_Integrated_Nm3",
+    "O2_change_count": "Oxygen_Change_Count",
+    "CINJ_used": "Carbon_Injection_Used",
+    "CINJ_total_on_sec": "Carbon_Injection_Total_On_sec",
+    "CINJ_max_flow": "Carbon_Injection_Max_kg_min",
+    "CINJ_integrated_kg": "Carbon_Injection_Integrated_kg",
+    "CINJ_change_count": "Carbon_Injection_Change_Count",
+    "ELEC_break_count": "Electrode_Break_Count",
+    "ELEC_replacement_count": "Electrode_Replacement_Count",
+    "ELEC_first_break_sec": "Electrode_First_Break_sec",
+    "ELEC_first_replacement_sec": "Electrode_First_Replacement_sec",
+    "ELEC_total_downtime_sec": "Electrode_Total_Downtime_sec",
+    "ANALYSIS_request_count": "Sample_Request_Count",
+    "ANALYSIS_received_count": "Sample_Result_Count",
+    "ANALYSIS_first_request_sec": "First_Sample_Request_sec",
+    "ANALYSIS_first_received_sec": "First_Sample_Result_sec",
+    "ANALYSIS_avg_wait_sec": "Average_Analysis_Wait_sec",
+    "ANALYSIS_max_wait_sec": "Max_Analysis_Wait_sec",
+    "ANALYSIS_total_wait_sec": "Total_Analysis_Wait_sec",
+    "TAP_start_sec": "Tapping_Start_sec",
+    "TAP_complete_sec": "Tapping_Complete_sec",
+    "TAP_duration_sec": "Tapping_Duration_sec",
+    "EVTADD_first_addition_sec": "First_Addition_sec",
+    "EVTADD_last_addition_sec": "Last_Addition_sec",
+    "EVTADD_event_count": "Addition_Event_Count",
+    "EVTADD_High_C_Ferro_Manganese_first_sec": "HC_FeMn_First_Addition_sec",
+    "EVTADD_Lime_first_sec": "Lime_First_Addition_sec",
+    "EVTADD_Dolomite_first_sec": "Dolomite_First_Addition_sec",
+    "EVTADD_Iron_Oxide_first_sec": "Iron_Oxide_First_Addition_sec",
+    "QUALITY_steel_pass": "Steel_Pass",
+    "QUALITY_slag_pass": "Slag_Pass",
+    "QUALITY_chemistry_pass": "Chemistry_Pass",
+    "QUALITY_time_pass": "Time_Pass",
+    "QUALITY_temperature_pass": "Temperature_Pass",
+    "QUALITY_mass_pass": "Mass_Pass",
+    "QUALITY_co2_pass": "CO2_Pass",
+    "QUALITY_overall_pass": "Overall_Pass",
+    "QUALITY_full_validation_available": "Validation_Available",
+    "QUALITY_unknown_event_count": "Unknown_Event_Count",
+    "QUALITY_warning_count": "Warning_Count",
+    "QUALITY_warning_text": "Warning_Text",
+    "QUALITY_multi_run_merged_detected": "Multi_Run_Merged_Suspect",
+}
+
+
+def _analysis_cost_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    mapping_applied = int(_number(row.get("COST_mapping_applied")) or 0) == 1
+    raw_residual: Optional[float] = None
+    if mapping_applied:
+        total = _number(row.get("COST_total_usd"))
+        additions = _number(row.get("COST_source_power_raw"))
+        scrap = _number(row.get("COST_source_additions_raw"))
+        power = _number(row.get("COST_source_other_consumables_raw"))
+        if all(value is not None for value in (total, additions, scrap, power)):
+            raw_residual = float(total - additions - scrap - power)
+    else:
+        raw_residual = _number(row.get("COST_other_consumables_reconstructed_usd"))
+    rounding_adjustment = (
+        raw_residual if raw_residual is not None and abs(raw_residual) <= 0.5 else 0.0
+    )
+    other = 0.0 if raw_residual is not None and abs(raw_residual) <= 0.5 else raw_residual
+    corrected = [
+        _number(row.get("COST_additions_usd")),
+        _number(row.get("COST_scrap_usd")),
+        _number(row.get("COST_power_usd")),
+        other,
+    ]
+    total = _number(row.get("COST_total_usd"))
+    reconciliation = (
+        sum(value for value in corrected if value is not None) - total
+        if total is not None and all(value is not None for value in corrected)
+        else None
+    )
+    return {
+        "Other_Consumables_Raw_Residual": raw_residual,
+        "Other_Consumables_USD": other,
+        "Cost_Rounding_Adjustment_USD": rounding_adjustment,
+        "Cost_Reconciliation_Error_USD": reconciliation,
+    }
+
+
+def build_analysis_dataframe(
+    runs_df: pd.DataFrame,
+    logs_df: pd.DataFrame,
+    ml_features_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Build a compact calculated/reconstructed sheet from the internal frame."""
+
+    wide = build_all_runs_export_df(runs_df, logs_df, ml_features_df)
+    records: list[dict[str, Any]] = []
+    for source in wide.to_dict("records"):
+        record: dict[str, Any] = {"Run_ID": source.get("META_run_id")}
+        for old, new in ANALYSIS_FIELD_MAP.items():
+            if old in source:
+                record[new] = source.get(old)
+        record.update(_analysis_cost_fields(source))
+
+        rm_source = source.get("QUALITY_rm_source")
+        if rm_source == "EVENT_LOG_RECONSTRUCTED":
+            for column, value in source.items():
+                if column.startswith("RM_") and column.endswith("_t") and column != "RM_total_mass_t":
+                    record[f"RM_Reconstructed_{column[3:]}"] = value
+        add_source = source.get("QUALITY_add_source")
+        if add_source == "EVENT_LOG_RECONSTRUCTED":
+            for column, value in source.items():
+                if column.startswith("ADD_") and column.endswith("_kg") and column != "ADD_total_kg":
+                    record[f"ADD_Reconstructed_{column[4:]}"] = value
+
+        for column, value in source.items():
+            match = re.fullmatch(r"PWR_(.+MW)_duration_sec", column)
+            if match:
+                record[f"Power_{match.group(1)}_sec"] = value
+            basket = re.fullmatch(r"BASKET_(\d+)_(time_sec|mass_t)", column)
+            if basket and int(basket.group(1)) <= 3:
+                suffix = "Time_sec" if basket.group(2) == "time_sec" else "Mass_t"
+                record[f"Basket{basket.group(1)}_{suffix}"] = value
+            gap = re.fullmatch(r"BASKET_(\d+)_to_(\d+)_gap_sec", column)
+            if gap and int(gap.group(1)) <= 2:
+                record[f"Basket{gap.group(1)}_to_{gap.group(2)}_Gap_sec"] = value
+
+        model_confidence = str(source.get("COST_other_model_confidence") or "")
+        if model_confidence in {"MEDIUM", "HIGH"}:
+            record.update(
+                {
+                    "Oxygen_Cost_Estimated_USD": source.get("COST_oxygen_estimated_usd"),
+                    "Carbon_Cost_Estimated_USD": source.get("COST_carbon_injection_estimated_usd"),
+                    "Tapping_Cost_Estimated_USD": source.get("COST_tapping_estimated_usd"),
+                    "Other_Unexplained_USD": source.get("COST_other_unexplained_usd"),
+                    "Other_Cost_Model_Confidence": model_confidence,
+                }
+            )
+        electrode_confidence = str(
+            source.get("COST_electrode_breakage_model_confidence") or ""
+        )
+        if electrode_confidence in {"MEDIUM", "HIGH"}:
+            record["Electrode_Breakage_Cost_Estimated_USD"] = source.get(
+                "COST_electrode_breakage_estimated_usd"
+            )
+        records.append(record)
+
+    frame = pd.DataFrame(records)
+    if frame.empty:
+        return pd.DataFrame(columns=["Run_ID"])
+    frame, _ = drop_all_null_export_columns(frame)
+    preferred = ["Run_ID"] + list(ANALYSIS_FIELD_MAP.values()) + [
+        "Other_Consumables_Raw_Residual", "Other_Consumables_USD",
+        "Cost_Rounding_Adjustment_USD", "Cost_Reconciliation_Error_USD",
+    ]
+    ordered = [column for column in preferred if column in frame]
+    remaining = sorted(
+        (column for column in frame if column not in ordered),
+        key=_natural_column_key,
+    )
+    return frame.reindex(columns=ordered + remaining)
+
+
+def build_excel_frames(
+    runs_df: pd.DataFrame,
+    logs_df: pd.DataFrame,
+    ml_features_df: Optional[pd.DataFrame] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    results = build_results_dataframe(runs_df, logs_df)
+    analysis = build_analysis_dataframe(runs_df, logs_df, ml_features_df)
+    return results, analysis
+
+
+def _header_group(column: str, sheet_name: str) -> str:
+    if sheet_name == "RESULTS":
+        if column.startswith("RM_"):
+            return "RM"
+        if column.startswith("ADD_"):
+            return "ADD"
+        if column.startswith("Steel_"):
+            return "STEEL"
+        if column.startswith("Slag_"):
+            return "SLAG"
+        if column.startswith("Event_Log_"):
+            return "EVENT"
+        if column.startswith("Reported_") or column in {"Total_Cost", "Cost_Per_Tonne"}:
+            return "COST"
+        if column in {
+            "Time_min", "Tapping_Mass_t", "Tap_Temperature_C",
+            "Total_Energy_kWh", "Energy_kWh_per_t",
+        }:
+            return "PERF"
+        return "RUN"
+    if column.startswith(("RM_", "ADD_")):
+        return "RECON"
+    if column.endswith("_Pass") or column in {
+        "Validation_Available", "Unknown_Event_Count", "Warning_Count", "Warning_Text"
+    }:
+        return "QUALITY"
+    if "Cost" in column or "Consumables" in column or column.startswith("Reported_Scrap"):
+        return "COST"
+    return "PROCESS"
+
+
+def apply_excel_formatting(
+    writer: pd.ExcelWriter, frame: pd.DataFrame, sheet_name: str
+) -> None:
+    worksheet = writer.book[sheet_name]
+    worksheet.freeze_panes = "B2"
     worksheet.auto_filter.ref = worksheet.dimensions
     worksheet.sheet_view.showGridLines = False
     worksheet.sheet_view.zoomScale = 85
-    worksheet.sheet_properties.outlinePr.summaryRight = True
-    group_colors = {
-        "META_": "1F4E78", "PERF_": "0F6B5D", "COST_": "8A5A00",
-        "QUALITY_": "7F1D1D", "RM_": "355E3B", "ADD_": "526D82",
-        "STEEL_": "4C566A", "SLAG_": "5B4B8A", "BASKET_": "6B5B3E",
-        "PWR_": "9A3412", "O2_": "0369A1", "CINJ_": "374151",
-        "ELEC_": "991B1B", "FAIL_": "991B1B", "EVTADD_": "7C3AED",
-        "ANALYSIS_": "0F766E", "TAP_": "B45309",
-        "DERIVED_": "475569", "RAW_": "334155",
+    colors = {
+        "RUN": "1F4E78", "PERF": "0F6B5D", "COST": "8A5A00",
+        "RM": "355E3B", "ADD": "526D82", "STEEL": "4C566A",
+        "SLAG": "5B4B8A", "EVENT": "334155", "RECON": "7C3AED",
+        "PROCESS": "0369A1", "QUALITY": "7F1D1D",
     }
     for cell in worksheet[1]:
-        prefix = next((item for item in group_colors if str(cell.value).startswith(item)), "META_")
-        cell.fill = PatternFill("solid", fgColor=group_colors[prefix])
+        cell.fill = PatternFill(
+            "solid", fgColor=colors[_header_group(str(cell.value), sheet_name)]
+        )
         cell.font = Font(color="FFFFFF", bold=True, name="Arial", size=10)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     worksheet.row_dimensions[1].height = 36
-    # Raw event cells can contain thousands of characters.  When wrap_text is
-    # enabled Excel auto-expands the whole Run row to several screen heights.
-    # Keep every Run compact; the full cell value remains available in the
-    # formula bar and is not truncated in the workbook.
     for row_index in range(2, len(frame) + 2):
         worksheet.row_dimensions[row_index].height = 20
 
@@ -1044,49 +1391,34 @@ def apply_excel_formatting(writer: pd.ExcelWriter, frame: pd.DataFrame) -> None:
                 len(str(value)) for value in frame[column].head(sample_rows)
                 if not _is_missing(value)
             )
-        width = 48 if column.startswith("RAW_") or column == "QUALITY_warning_text" else min(max(max(lengths, default=8) + 2, 11), 24)
-        worksheet.column_dimensions[letter].width = width
-        if column.startswith("RAW_") or column == "QUALITY_warning_text":
+        raw_event = str(column).startswith("Event_Log_Raw_")
+        worksheet.column_dimensions[letter].width = (
+            48 if raw_event or column == "Warning_Text"
+            else min(max(max(lengths, default=8) + 2, 11), 24)
+        )
+        if raw_event or column == "Warning_Text":
             for cell in worksheet[letter][1:]:
                 cell.alignment = Alignment(vertical="center", wrap_text=False)
-
-    def detail_column(column: str) -> bool:
-        if column.startswith(("ELEC_", "FAIL_", "EVTADD_", "ANALYSIS_", "DERIVED_", "RAW_")):
-            return True
-        if column.startswith(("STEEL_", "SLAG_")):
-            return column.endswith(
-                ("_min", "_max", "_pass", "_margin_low", "_margin_high", "_normalized_position")
-            )
-        if column.startswith("BASKET_"):
-            return bool(re.match(r"^BASKET_\d+_.+_t$", column))
-        if column.startswith("PWR_"):
-            return column.endswith("MW_duration_sec")
-        return False
-
-    for index, column in enumerate(frame.columns, start=1):
-        if detail_column(str(column)):
-            dimension = worksheet.column_dimensions[get_column_letter(index)]
-            dimension.outlineLevel = 1
-            dimension.hidden = True
-            dimension.collapsed = False
-
-    green = PatternFill("solid", fgColor="DCFCE7")
-    red = PatternFill("solid", fgColor="FEE2E2")
-    for index, column in enumerate(frame.columns, start=1):
-        if column.startswith("QUALITY_") and column.endswith(("_pass", "_consistent")):
-            letter = get_column_letter(index)
-            target = f"{letter}2:{letter}{max(2, len(frame) + 1)}"
-            worksheet.conditional_formatting.add(
-                target, CellIsRule(operator="equal", formula=["1"], fill=green)
-            )
-            worksheet.conditional_formatting.add(
-                target, CellIsRule(operator="equal", formula=["0"], fill=red)
-            )
-
-        if column in {"COST_per_tonne_usd", "PERF_time_min", "PERF_total_energy_kwh"}:
-            letter = get_column_letter(index)
+        if column.endswith("_USD") or column in {
+            "Total_Cost", "Cost_Per_Tonne", "Reported_Power", "Reported_Scrap",
+            "Reported_Additions", "Reported_Other_Consumables",
+        }:
             for cell in worksheet[letter][1:]:
                 cell.number_format = '#,##0.00'
+
+    if sheet_name == "ANALYSIS":
+        green = PatternFill("solid", fgColor="DCFCE7")
+        red = PatternFill("solid", fgColor="FEE2E2")
+        for index, column in enumerate(frame.columns, start=1):
+            if column.endswith("_Pass"):
+                letter = get_column_letter(index)
+                target = f"{letter}2:{letter}{max(2, len(frame) + 1)}"
+                worksheet.conditional_formatting.add(
+                    target, CellIsRule(operator="equal", formula=["1"], fill=green)
+                )
+                worksheet.conditional_formatting.add(
+                    target, CellIsRule(operator="equal", formula=["0"], fill=red)
+                )
 
 
 def make_excel(
@@ -1094,17 +1426,35 @@ def make_excel(
     logs_df: pd.DataFrame,
     ml_features_df: Optional[pd.DataFrame] = None,
 ) -> BytesIO:
-    all_runs = build_all_runs_export_df(runs_df, logs_df, ml_features_df)
-    return make_excel_from_frame(all_runs)
+    results, analysis = build_excel_frames(runs_df, logs_df, ml_features_df)
+    return make_excel_from_frames(results, analysis)
 
 
-def make_excel_from_frame(all_runs: pd.DataFrame) -> BytesIO:
-    """Serialize one already-built ALL_RUNS frame without rebuilding features."""
+def make_excel_from_frames(results: pd.DataFrame, analysis: pd.DataFrame) -> BytesIO:
+    """Serialize the exact two-sheet public workbook schema."""
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        clean_dataframe_for_excel(all_runs).to_excel(writer, sheet_name="ALL_RUNS", index=False)
-        apply_excel_formatting(writer, all_runs)
+        clean_dataframe_for_excel(results).to_excel(
+            writer, sheet_name="RESULTS", index=False
+        )
+        clean_dataframe_for_excel(analysis).to_excel(
+            writer, sheet_name="ANALYSIS", index=False
+        )
+        apply_excel_formatting(writer, results, "RESULTS")
+        apply_excel_formatting(writer, analysis, "ANALYSIS")
+    output.seek(0)
+    return output
+
+
+def make_excel_from_frame(all_runs: pd.DataFrame) -> BytesIO:
+    """Legacy helper retained for callers that explicitly need an internal dump."""
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        clean_dataframe_for_excel(all_runs).to_excel(
+            writer, sheet_name="INTERNAL_FEATURES", index=False
+        )
     output.seek(0)
     return output
 
@@ -1146,4 +1496,43 @@ def summarize_export_frame(frame: pd.DataFrame) -> dict[str, int]:
                 errors="coerce",
             ).fillna(0).gt(0).sum()
         ),
+    }
+
+
+def summarize_export_frames(
+    results: pd.DataFrame, analysis: pd.DataFrame
+) -> dict[str, int]:
+    """Return UI diagnostics for the public two-sheet workbook."""
+
+    def count_equals(column: str, value: str) -> int:
+        if column not in analysis:
+            return 0
+        return int(analysis[column].fillna("").astype(str).eq(value).sum())
+
+    mapping = pd.to_numeric(
+        analysis.get("Cost_Mapping_Applied", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0)
+    warnings = pd.to_numeric(
+        analysis.get("Warning_Count", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    return {
+        "runs": len(results),
+        "results_columns": len(results.columns),
+        "analysis_columns": len(analysis.columns),
+        "columns": len(results.columns) + len(analysis.columns),
+        "merged_suspects": int(
+            pd.to_numeric(
+                analysis.get("Multi_Run_Merged_Suspect", pd.Series(dtype=float)),
+                errors="coerce",
+            ).fillna(0).sum()
+        ),
+        "rm_report": count_equals("RM_Source", "REPORT")
+        + count_equals("RM_Source", "REPORT_AND_LOG_VERIFIED"),
+        "rm_reconstructed": count_equals("RM_Source", "EVENT_LOG_RECONSTRUCTED"),
+        "add_report": count_equals("ADD_Source", "REPORT")
+        + count_equals("ADD_Source", "REPORT_AND_LOG_VERIFIED"),
+        "add_reconstructed": count_equals("ADD_Source", "EVENT_LOG_RECONSTRUCTED"),
+        "cost_mapping_warnings": int(mapping.sum()),
+        "warning_runs": int(warnings.gt(0).sum()),
     }

@@ -259,62 +259,29 @@ Streamlit Community Cloud 기준:
 
 Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. 참고: [Supabase Auth](https://supabase.com/docs/guides/auth), [Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security). Gmail 처리 label은 공식 `users.messages.modify` API를 사용합니다: [Gmail messages.modify](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/modify).
 
-## 14. Single-sheet Excel export
+## 14. Two-sheet Excel export
 
 앱의 `다운로드` 메뉴에서 현재 필터 또는 전체 데이터의 Excel을 생성할 수 있습니다.
-파일명은 `SteelChallenge_Master_YYYYMMDD_HHMMSS.xlsx`이며 workbook에는
-`ALL_RUNS` 시트 하나만 존재합니다.
+파일명은 `SteelChallenge_Master_YYYYMMDD_HHMMSS.xlsx`이며 workbook에는 정확히
+`RESULTS`, `ANALYSIS` 두 시트가 존재합니다. 두 시트는 동일한 Run 순서를 유지하고
+`Run_ID`로 1:1 연결됩니다.
 
-- 한 Simulation Run은 정확히 한 행입니다.
-- 열은 `META_`, `PERF_`, `COST_`, `QUALITY_`, `RM_`, `ADD_`, `STEEL_`,
-  `SLAG_`, `BASKET_`, `PWR_`, `O2_`, `CINJ_`, `ELEC_`, `EVTADD_`,
-  `ANALYSIS_`, `TAP_`, `DERIVED_`, `RAW_` 그룹 순으로 정렬됩니다.
-- Raw Materials, Additions, Steel/Slag Composition은 Run별 wide format으로
-  정리됩니다. 새 material, element, power setpoint는 union schema에 동적으로
-  추가되며 동일 schema의 열 순서는 항상 같습니다.
-- Report Raw Materials/Additions가 없으면 Event Log의 Basket/Additions를 합산해
-  복원하고 `QUALITY_rm_source`, `QUALITY_add_source`에 provenance를 기록합니다.
-  같은 Basket 안에 같은 재료가 반복되면 마지막 값으로 덮지 않고 합산합니다.
-  새로 수집한 Run은 `QUALITY_rm_parse_status`, `QUALITY_add_parse_status`로
-  report parsed/section missing/parse failed/event reconstructed 상태도 구분합니다.
-- EAF Cost Breakdown은 SteelUniversity 원본의 알려진 label shift로 처리합니다.
-  `COST_source_*_raw` 네 열은 그대로 보존하고 EAF에서만
-  `source Other→COST_power_usd`, `source Additions→COST_scrap_usd`,
-  `source Power→COST_additions_usd`로 의미를 교정합니다. source Scrap은
-  process time 중복 여부만 검증하고 비용에는 사용하지 않습니다. 실제 Other는
-  Total Cost residual인 `COST_other_consumables_reconstructed_usd`로 복원하며
-  `COST_mapping_type=STEELUNIVERSITY_EAF_KNOWN_SHIFT`로 provenance를 남깁니다.
-  Secondary Steelmaking 등 다른 공정에는 이 mapping을 적용하지 않습니다.
-- Other consumables 세부 비용은 전극 파손이 없는 Run으로 non-negative 후보 모델을
-  비교할 만큼 표본이 있을 때만 Tapping/Oxygen/Carbon으로 추정합니다. 전극 파손
-  비용은 해당 baseline의 잔차에서 데이터 기반으로 추정하며, 표본이 부족하면
-  임의 단가를 만들지 않고 `INSUFFICIENT_DATA`와 unexplained residual을 남깁니다.
-- `Electrode breakage`와 replacement 문구는 FIFO로 대응하여 `ELEC_break_count`,
-  `ELEC_total_downtime_sec` 등을 계산합니다. 대응되지 않는 event는 warning과 raw
-  log에 보존합니다.
-- `QUALITY_chemistry_pass`는 Steel/Slag chemistry만 뜻합니다. 온도·시간·질량·CO2
-  spec이 모두 확인되지 않으면 `QUALITY_full_validation_available=0`이고
-  `QUALITY_overall_pass`는 생성하지 않습니다.
-- Min/Max가 없는 composition element는 Current 열만 생성합니다. 전체 Run에서
-  완전히 비어 있는 열과 의미·값이 모두 같은 지정된 표시 중복 열은 export에서
-  제거되므로 열 수는 데이터에 따라 달라집니다.
-- Event Log는 Run ID별로 한 번 group하여 Power 지속시간, Basket 시각/질량,
-  Addition 시각, Analysis 대기시간, Tapping 시각 등의 feature로 변환됩니다.
-- 원본 Event Log와 인식하지 못한 이벤트도 버리지 않습니다. Excel 셀 제한을
-  넘는 로그는 30,000자 단위의 `RAW_event_log_01`, `_02`, ... 열로 손실 없이
-  나눕니다.
-- Steel/Slag spec 상세, Basket 재료 상세, Power setpoint별 지속시간, Addition timing,
-  Analysis, Derived, Raw Log는 기본 접힘 Excel outline으로 제공하며 header filter와
-  `G2` freeze pane을 적용합니다.
-- Power 적분은 actual energy가 아니라 setpoint 적분입니다.
-  `PWR_setpoint_integral_MW_sec`, `PWR_setpoint_integral_MW_min`,
-  `PWR_setpoint_equivalent_MWh`로 명시하고 actual energy는
-  `PERF_total_energy_kwh`만 사용합니다.
-- 내부 DB/ML의 기존 `feature >` 이름은 유지합니다. Final Steel/Slag와 Raw Log는
-  기존 ML 입력에 자동 추가하지 않습니다.
-- 과거 방식으로 여러 결과가 한 DB 행에 합쳐진 의심 record는 값을 삭제하지 않고
-  `QUALITY_multi_run_merged_detected=1`로 표시합니다. ML 학습에서는 제외하며,
-  원본 Gmail 재처리 절차로 별도 Run으로 복구합니다.
+- 한 Simulation Run은 각 시트에 정확히 한 행입니다.
+- `RESULTS`는 SteelUniversity가 보고한 Run/Performance/Cost, Raw Materials,
+  Additions, Steel/Slag Current·Min·Max와 원본 Event Log만 포함합니다. 원본 RM/ADD
+  section이 없으면 빈칸을 유지하며 Event Log 복원값으로 덮어쓰지 않습니다.
+- `ANALYSIS`는 EAF cost label 보정, RM/ADD Event Log 복원, Basket/Power/Oxygen/
+  Carbon/Electrode/Sample/Tapping timing과 기본 품질 판정만 포함합니다. Raw Event
+  Log는 중복 저장하지 않습니다.
+- EAF cost 원본 label은 `RESULTS`의 `Reported_*`에 그대로 남고, 해석된 비용은
+  `ANALYSIS`의 `Corrected_*`와 `Other_Consumables_USD`에만 기록됩니다. ±0.5 USD
+  이내 residual은 0으로 정리하고 `Cost_Rounding_Adjustment_USD`에 보존합니다.
+- 원본 Event Log는 Excel 셀 제한을 피하도록 30,000자 단위의
+  `Event_Log_Raw_01`, `_02`, ... 열로 손실 없이 나눕니다.
+- 모든 Run에서 완전히 비어 있는 열은 시트별로 제거하고, 두 시트 모두 filter와
+  `B2` freeze pane을 적용합니다.
+- 내부 DB/ML의 기존 `feature >` 및 wide feature schema는 그대로 유지합니다.
+  Excel schema와 ML internal feature schema는 서로 독립입니다.
 
 ## 15. Composite Gmail result repair
 
@@ -339,7 +306,7 @@ Supabase는 Auth JWT와 RLS를 함께 사용하는 구조를 권장합니다. �
 - `gmail_client.py`, `email_ingest.py`: Gmail API와 예약 worker
 - `db_utils.py`, `auth_utils.py`, `config.py`: DB/Auth/secret 계층
 - `feature_engineering.py`, `ml_engine.py`, `active_learning.py`: 공정 feature와 분석
-- `visualization.py`, `excel_utils.py`, `export_features.py`: Plotly 및 single-sheet `ALL_RUNS` Excel
+- `visualization.py`, `excel_utils.py`, `export_features.py`: Plotly 및 two-sheet Excel
 - `supabase/schema.sql`, `supabase/rls.sql`: DB migration과 권한
 - `supabase/multi_run_email_migration.sql`: 기존 DB의 다중 Run 이메일 지원 migration
 - `tests/`: parser, DOCX 회귀, feature, ML, Excel 테스트
